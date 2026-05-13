@@ -12,8 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
+from config import load_config
 from runner import (
-    load_config, load_scenarios, run_openai, run_anthropic,
+    load_scenarios, run_openai, run_anthropic,
     format_duration, print_report,
 )
 from openai import OpenAI

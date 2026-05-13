@@ -169,6 +169,7 @@ export interface DeepSeekConfig {
   model_types: string[];
   max_input_tokens: number[];
   max_output_tokens: number[];
+  input_character_limits: number[];
   model_aliases: string[];
   tool_call: ToolCallTagConfig;
 }

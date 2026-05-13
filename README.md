@@ -62,22 +62,13 @@ docker compose -f docker-compose.yaml up -d
 
 ### 免费测试账号
 
-以下账号密码统一为 `test12345`：
+~~以下账号密码统一为 `test12345`：~~
 
 ```text
-debatefeatgdcdve+mclendon@gmail.com
-t.a.ya.hs.c.h.war.z2.5.7@gmail.com
-vsigsiehvdidod+hewitt@gmail.com
-sks.j.hsms.h.sms.n.bv@gmail.com
-slsnvskshevvekeb+berg@gmail.com
-v.s.i.gs.i.ehv.di.d.o.d@gmail.com
-slsnvskshevvekeb+christie@gmail.com
-wa.sh.brom.a.i.1.9.1@gmail.com
+不太稳定, 这里不再提供, 请自行注册
 ```
 
-> 💡 使用 [emailtick.com](https://www.emailtick.com/zh) 可快速创建无限数量的 Gmail 临时账号；
-> 测试账号被封后可自行注册替换。
-> 来自[issue #62](https://github.com/NIyueeE/ds-free-api/issues/62)
+> 可以参考[issue #62](https://github.com/NIyueeE/ds-free-api/issues/62)的方法
 
 ## API 端点
 

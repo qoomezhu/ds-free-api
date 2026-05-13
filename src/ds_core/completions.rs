@@ -15,7 +15,7 @@ use pin_project_lite::pin_project;
 
 use crate::ds_core::CoreError;
 use crate::ds_core::accounts::{AccountGuard, AccountPool};
-use crate::ds_core::client::{CompletionPayload, DsClient, StopStreamPayload};
+use crate::ds_core::client::{ClientError, CompletionPayload, DsClient, StopStreamPayload};
 use crate::ds_core::pow::PowSolver;
 
 pub(crate) struct ActiveSession {
@@ -151,10 +151,18 @@ pub struct Completions {
     solver: RwLock<PowSolver>,
     pool: Arc<AccountPool>,
     active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
+    model_types: Vec<String>,
+    input_character_limits: Vec<u32>,
 }
 
 impl Completions {
-    pub async fn new(client: DsClient, solver: PowSolver, pool: AccountPool) -> Self {
+    pub async fn new(
+        client: DsClient,
+        solver: PowSolver,
+        pool: AccountPool,
+        model_types: Vec<String>,
+        input_character_limits: Vec<u32>,
+    ) -> Self {
         let pool = Arc::new(pool);
         // 存储 client/solver 供后台恢复任务使用
         pool.set_client_solver(client.clone(), solver.clone()).await;
@@ -165,7 +173,20 @@ impl Completions {
             solver: RwLock::new(solver),
             pool,
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
+            model_types,
+            input_character_limits,
         }
+    }
+
+    /// 获取指定 model_type 的 input_character_limit
+    fn input_character_limit_for(&self, model_type: &str) -> usize {
+        self.model_types
+            .iter()
+            .position(|t| t == model_type)
+            .and_then(|i| self.input_character_limits.get(i))
+            .copied()
+            .map(|v| v as usize)
+            .unwrap_or(163_840)
     }
 
     pub async fn v0_chat(
@@ -173,43 +194,42 @@ impl Completions {
         req: ChatRequest,
         request_id: &str,
     ) -> Result<ChatResponse, CoreError> {
-        const MAX_ATTEMPTS: usize = 3;
+        let limit = self.input_character_limit_for(&req.model_type);
+        let threshold = (limit as u64 * 75 / 100) as usize;
+        let oversized = req.prompt.chars().count() > threshold;
 
-        // 2. 拆分历史（支持 ChatML 和非 ChatML 格式）—— 与账号无关，只需做一次
-        let (inline_prompt, history_content) = split_history_prompt(&req.prompt);
-
-        if !history_content.is_empty() {
+        // 超限时按模型类型选择回退方案
+        if oversized {
             log::debug!(
                 target: "ds_core::accounts",
-                "req={} 触发历史拆分, history_size={}", request_id, history_content.len()
+                "req={} prompt 超限 ({} chars > {} threshold), model_type={}, 触发回退方案",
+                request_id,
+                req.prompt.chars().count(),
+                threshold,
+                req.model_type,
             );
+            return match req.model_type.as_str() {
+                "expert" => self.v0_chat_oversized_chunk(&req, request_id).await,
+                _ => self.v0_chat_oversized_file(&req, request_id).await,
+            };
         }
 
+        // 不超限：所有模型统一直发（完整 prompt，无历史拆分，无文件上传回退）
+        const MAX_ATTEMPTS: usize = 3;
         for attempt in 0..MAX_ATTEMPTS {
             let first_try = attempt == 0;
             match self
-                .v0_chat_once(
-                    &req,
-                    &inline_prompt,
-                    &history_content,
-                    request_id,
-                    first_try,
-                )
+                .v0_chat_once(&req, &req.prompt, "", request_id, first_try)
                 .await
             {
                 Ok(resp) => return Ok(resp),
                 Err(CoreError::Overloaded) => {
-                    // Overloaded 可能来自：1) 号池无账号（不可重试）2) 账号 rate_limit（已标记 Error，可换号重试）
-                    // 如果是号池空导致的 Overloaded，第二次也拿不到账号，直接返回
-                    // 如果是 rate_limit 导致的，账号已被标记 Error，下次会换号
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
                     }
-                    // 短暂延迟后重试（如果是号池空，重试也会快速失败）
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
-                    // 其他错误：ProviderError/Stream 等，账号已被标记 Error，换号重试
                     log::warn!(
                         target: "ds_core::accounts",
                         "req={} 请求失败 (attempt {}/{}): {}",
@@ -223,6 +243,325 @@ impl Completions {
             }
         }
         Err(CoreError::Overloaded)
+    }
+
+    /// 回退方案 A：历史文件上传（default / vision）
+    async fn v0_chat_oversized_file(
+        &self,
+        req: &ChatRequest,
+        request_id: &str,
+    ) -> Result<ChatResponse, CoreError> {
+        const MAX_ATTEMPTS: usize = 3;
+
+        let (inline_prompt, history_content) = split_history_prompt(&req.prompt);
+
+        if !history_content.is_empty() {
+            log::debug!(
+                target: "ds_core::accounts",
+                "req={} 触发历史拆分, history_size={}", request_id, history_content.len()
+            );
+        }
+
+        for attempt in 0..MAX_ATTEMPTS {
+            let first_try = attempt == 0;
+            match self
+                .v0_chat_once(req, &inline_prompt, &history_content, request_id, first_try)
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(CoreError::Overloaded) => {
+                    if attempt + 1 >= MAX_ATTEMPTS {
+                        return Err(CoreError::Overloaded);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "ds_core::accounts",
+                        "req={} 请求失败 (attempt {}/{}): {}",
+                        request_id, attempt + 1, MAX_ATTEMPTS, e
+                    );
+                    if attempt + 1 >= MAX_ATTEMPTS {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        Err(CoreError::Overloaded)
+    }
+
+    /// 回退方案 B：分块 completion 写入 session（expert，绕过文件上传限制）
+    async fn v0_chat_oversized_chunk(
+        &self,
+        req: &ChatRequest,
+        request_id: &str,
+    ) -> Result<ChatResponse, CoreError> {
+        // 1. 获取账号
+        let guard = self
+            .pool
+            .get_account_with_wait(30_000)
+            .await
+            .ok_or_else(|| {
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} 账号池无可用账号", request_id
+                );
+                CoreError::Overloaded
+            })?;
+        let account = guard.account();
+        let account_id = account.display_id().to_string();
+        let token = account.token().to_string();
+        let client = self.client.read().await.clone();
+
+        log::debug!(
+            target: "ds_core::accounts",
+            "req={} 分块写入: model_type=expert, account={}", request_id, account_id
+        );
+
+        // 2. 创建 session（所有 chunk 共享）
+        let session_id = match client.create_session(&token).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.pool.mark_error(&account_id);
+                return Err(e.into());
+            }
+        };
+
+        // 3. 按 75% limit 切分 prompt
+        let limit = self.input_character_limit_for(&req.model_type);
+        let chunk_size = (limit as u64 * 75 / 100) as usize;
+        let chunks = split_prompt_chunks(&req.prompt, chunk_size);
+
+        // 4. Feed 非末 chunk 到 session（每个 chunk 独立 PoW，首 chunk parent=null，后续以前一个 response_message_id 为 parent）
+        let mut parent_message_id: Option<i64> = None;
+        for (i, chunk) in chunks[..chunks.len() - 1].iter().enumerate() {
+            let pow_header = match self
+                .compute_pow_for_target(&token, "/api/v0/chat/completion")
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    self.pool.mark_error(&account_id);
+                    let _ = client.delete_session(&token, &session_id).await;
+                    return Err(e);
+                }
+            };
+
+            let payload = CompletionPayload {
+                chat_session_id: session_id.clone(),
+                parent_message_id,
+                model_type: req.model_type.clone(),
+                prompt: chunk.clone(),
+                ref_file_ids: vec![],
+                thinking_enabled: false,
+                search_enabled: false,
+                preempt: false,
+            };
+
+            let mut stream = match client.completion(&token, &pow_header, &payload).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.pool.mark_error(&account_id);
+                    let _ = client.delete_session(&token, &session_id).await;
+                    return Err(e.into());
+                }
+            };
+
+            // 等 ready（含 stop_id）+ update_session，同时带回剩余缓冲区
+            let (stop_id, mut close_buf) =
+                wait_ready_and_update(&mut stream, request_id, i + 1, chunks.len() - 1).await?;
+
+            // 记录 response_message_id 作为下一 chunk 的 parent
+            parent_message_id = Some(stop_id);
+
+            // 发送停止信号（fire-and-forget）
+            let stop_client = client.clone();
+            let stop_token = token.clone();
+            let stop_session = session_id.clone();
+            tokio::spawn(async move {
+                let _ = stop_client
+                    .stop_stream(
+                        &stop_token,
+                        &StopStreamPayload {
+                            chat_session_id: stop_session,
+                            message_id: stop_id,
+                        },
+                    )
+                    .await;
+            });
+
+            // 消费流直到 close 事件（先检查 close_buf 中是否已有 close）
+            wait_close(
+                &mut stream,
+                &mut close_buf,
+                request_id,
+                i + 1,
+                chunks.len() - 1,
+            )
+            .await?;
+
+            log::debug!(
+                target: "ds_core::accounts",
+                "req={} 分块 {}/{} parent={:?}", request_id, i + 1, chunks.len() - 1, parent_message_id
+            );
+        }
+
+        // 5. 末 chunk：新 PoW + 正常 completion + SSE 流
+        let last_chunk = chunks.into_iter().last().unwrap();
+        let pow_header = match self
+            .compute_pow_for_target(&token, "/api/v0/chat/completion")
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                self.pool.mark_error(&account_id);
+                let _ = client.delete_session(&token, &session_id).await;
+                return Err(e);
+            }
+        };
+
+        let payload = CompletionPayload {
+            chat_session_id: session_id.clone(),
+            parent_message_id,
+            model_type: req.model_type.clone(),
+            prompt: last_chunk,
+            ref_file_ids: vec![],
+            thinking_enabled: req.thinking_enabled,
+            search_enabled: req.search_enabled,
+            preempt: false,
+        };
+
+        let mut raw_stream = match client.completion(&token, &pow_header, &payload).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.pool.mark_error(&account_id);
+                let _ = client.delete_session(&token, &session_id).await;
+                return Err(e.into());
+            }
+        };
+
+        // 收集前两个 SSE 事件（ready + hint/update_session）
+        let mut buf = Vec::new();
+        let mut text_buf = String::new();
+        let (ready_block, second_block) = loop {
+            let chunk = raw_stream
+                .next()
+                .await
+                .ok_or_else(|| {
+                    let raw = String::from_utf8_lossy(&buf);
+                    if let Some(biz_code) = raw
+                        .lines()
+                        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .and_then(|v| v.pointer("/data/biz_code").and_then(|c| c.as_i64()))
+                    {
+                        let biz_msg = raw
+                            .lines()
+                            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                            .and_then(|v| {
+                                v.pointer("/data/biz_msg")
+                                    .and_then(|m| m.as_str().map(String::from))
+                            })
+                            .unwrap_or_default();
+                        log::error!(
+                            target: "ds_core::accounts",
+                            "req={} SSE 流返回业务错误: biz_code={}, biz_msg={}",
+                            request_id, biz_code, biz_msg
+                        );
+                        self.pool.mark_error(&account_id);
+                        return CoreError::ProviderError(format!(
+                            "biz_code={}, {}",
+                            biz_code, biz_msg
+                        ));
+                    }
+                    // 检查顶层 code 字段（如 INVALID_POW_RESPONSE）
+                    if raw.trim().starts_with('{') {
+                        self.pool.mark_error(&account_id);
+                        return parse_json_error(&raw, request_id);
+                    }
+                    log::error!(
+                        target: "ds_core::accounts",
+                        "req={} 空 SSE 流, 已收到 {} 字节: {}", request_id, buf.len(), raw
+                    );
+                    CoreError::Stream(format!("空 SSE 流 (已收到 {} 字节)", buf.len()))
+                })?
+                .map_err(|e| CoreError::Stream(e.to_string()))?;
+            log::trace!(
+                target: "ds_core::accounts",
+                "req={} <<< ({} bytes) {}", request_id, chunk.len(), String::from_utf8_lossy(&chunk)
+            );
+            buf.extend_from_slice(&chunk);
+            text_buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            if let Some((first, second)) = split_two_events(&text_buf) {
+                break (first.to_owned(), second.to_owned());
+            }
+        };
+
+        let (_, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
+
+        // 检查 hint 事件
+        if let Some(err) = check_hint(&second_block) {
+            if let CoreError::Overloaded = &err {
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} hint 限流: rate_limit_reached", request_id
+                );
+                self.pool.mark_error(&account_id);
+            } else {
+                let hint_detail = second_block
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|v| {
+                        v.get("content")
+                            .or_else(|| v.get("finish_reason"))
+                            .and_then(|c| c.as_str().map(String::from))
+                    })
+                    .unwrap_or_else(|| "(unknown)".into());
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} hint 错误: {}", request_id, hint_detail
+                );
+            }
+            let _ = client.delete_session(&token, &session_id).await;
+            return Err(err);
+        }
+
+        log::debug!(
+            target: "ds_core::accounts",
+            "req={} SSE ready: resp_msg={}", request_id, stop_id
+        );
+
+        // 注册活跃 session
+        {
+            let mut map = self.active_sessions.lock().unwrap();
+            map.insert(
+                session_id.clone(),
+                ActiveSession {
+                    token: token.clone(),
+                    session_id: session_id.clone(),
+                    message_id: stop_id,
+                },
+            );
+        }
+
+        // 重建流（含已消耗的 buf）
+        let stream =
+            futures::stream::once(futures::future::ready(Ok(Bytes::from(buf)))).chain(raw_stream);
+
+        Ok(ChatResponse {
+            stream: Box::pin(GuardedStream::new(
+                Box::pin(stream),
+                guard,
+                client.clone(),
+                token,
+                session_id,
+                stop_id,
+                self.active_sessions.clone(),
+            )),
+            account_id,
+        })
     }
 
     /// 单次请求尝试（不含重试逻辑）
@@ -677,6 +1016,16 @@ impl Completions {
 
 // ── ChatML 解析与历史拆分 ──────────────────────────────────────────────
 
+/// 按字符数切分 prompt 为 chunk（不感知标签边界）
+fn split_prompt_chunks(prompt: &str, chunk_size: usize) -> Vec<String> {
+    prompt
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(chunk_size)
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
 struct ChatBlock {
     role: String,
     content: String,
@@ -719,29 +1068,23 @@ fn parse_native_blocks(prompt: &str) -> Vec<ChatBlock> {
 
 /// 拆分 prompt 为 inline_prompt 和 history_content
 ///
-/// 优先策略：找到最后一个带 `<think>` 的 `<｜Assistant｜>` 块，
-/// - inline = 仅该 assistant+think 块（包含工具提醒等）
+/// 优先策略：找到最后一个 `<｜Assistant｜>` 块（不论有没有 `<think>`），
+/// - inline = 仅该 assistant 块（空的或含 think 指令）
 /// - history = 其余所有块，包装为 [file content end] … [file content begin] 格式上传
 ///
-/// 无 think 块时（如无工具定义的简单对话），退回到原来基于 user/tool 的切分：
-/// - inline = 最后一个 user/tool 块 → 末尾
-/// - history = 其余块
+/// 无 assistant 块时退回完整 prompt 内联（不应发生在正常 prompt 中）
 fn split_history_prompt(prompt: &str) -> (String, String) {
     let blocks = parse_native_blocks(prompt);
 
-    // 优先：找最后一个带 <think> 的 assistant 块，只保留该块 inline
-    if let Some(think_idx) = blocks
-        .iter()
-        .rposition(|b| b.role == "assistant" && b.content.contains("<think>"))
-    {
+    if let Some(ast_idx) = blocks.iter().rposition(|b| b.role == "assistant") {
         let mut inline = String::new();
-        inline.push_str(&role_tag(&blocks[think_idx].role));
-        inline.push_str(&blocks[think_idx].content);
+        inline.push_str(&role_tag(&blocks[ast_idx].role));
+        inline.push_str(&blocks[ast_idx].content);
         inline.push('\n');
 
         let mut history = String::new();
         history.push_str("[file content end]\n\n");
-        for block in &blocks[..think_idx] {
+        for block in &blocks[..ast_idx] {
             history.push_str(&role_tag(&block.role));
             history.push_str(&block.content);
             history.push('\n');
@@ -751,32 +1094,8 @@ fn split_history_prompt(prompt: &str) -> (String, String) {
         return (inline, history);
     }
 
-    // 无 think 块 → 原来基于 user/tool 的切分
-    let split_idx = match blocks
-        .iter()
-        .rposition(|b| b.role == "user" || b.role == "tool")
-    {
-        Some(i) if i > 0 => i,
-        _ => return (prompt.to_string(), String::new()),
-    };
-
-    let mut inline = String::new();
-    for block in &blocks[split_idx..] {
-        inline.push_str(&role_tag(&block.role));
-        inline.push_str(&block.content);
-        inline.push('\n');
-    }
-
-    let mut history = String::new();
-    history.push_str("[file content end]\n\n");
-    for block in &blocks[..split_idx] {
-        history.push_str(&role_tag(&block.role));
-        history.push_str(&block.content);
-        history.push('\n');
-    }
-    history.push_str("[file name]: IGNORE\n[file content begin]\n");
-
-    (inline, history)
+    // 没有 assistant 块（理论不应发生），完整 prompt 内联
+    (prompt.to_string(), String::new())
 }
 
 // ── SSE 解析辅助 ──────────────────────────────────────────────────────
@@ -832,4 +1151,149 @@ fn parse_ready_message_ids(chunk: &[u8]) -> (i64, i64) {
         }
     }
     (1, 2)
+}
+
+/// 解析非 SSE 的 JSON 错误响应（如 `{"code":40301,"msg":"INVALID_POW_RESPONSE","data":null}`）
+///
+/// 根据 `code` 映射为对应的 CoreError：
+/// - 1001 / 1201 → rate_limit → Overloaded
+/// - 40301 → INVALID_POW_RESPONSE → ProviderError
+/// - 其他 → ProviderError
+///
+/// 等待 SSE 流中的 ready（含 response_message_id）和 update_session（session 已持久化）
+///
+/// 返回 (stop_id, buf)，buf 是已读取的原始字节（可能包含 update_session 后的数据，供 wait_close 复用）
+async fn wait_ready_and_update(
+    stream: &mut Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>,
+    request_id: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+) -> Result<(i64, Vec<u8>), CoreError> {
+    let mut buf = Vec::new();
+    let mut ready_msg_id: Option<i64> = None;
+    loop {
+        let chunk = stream
+            .next()
+            .await
+            .ok_or_else(|| {
+                let raw = String::from_utf8_lossy(&buf);
+                if raw.trim().starts_with('{') {
+                    return parse_json_error(&raw, request_id);
+                }
+                CoreError::Stream(format!(
+                    "req={} 分块 {}/{} 收到空流",
+                    request_id, chunk_index, total_chunks
+                ))
+            })?
+            .map_err(|e| CoreError::Stream(e.to_string()))?;
+        buf.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&buf);
+
+        let events: Vec<&str> = text.split("\n\n").collect();
+        let n_complete = if text.ends_with("\n\n") {
+            events.len()
+        } else {
+            events.len().saturating_sub(1)
+        };
+
+        for event in events[..n_complete].iter() {
+            if event.is_empty() {
+                continue;
+            }
+            // hint → 错误
+            if let Some(err) = check_hint(event) {
+                return Err(err);
+            }
+            // ready → 记下 stop_id
+            if event.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("event:")
+                    .is_some_and(|v| v.trim() == "ready")
+            }) {
+                ready_msg_id = Some(parse_ready_message_ids(event.as_bytes()).1);
+            }
+            // update_session + ready 已收到 → 完成
+            if let Some(id) = ready_msg_id
+                && event.lines().any(|l| {
+                    l.trim()
+                        .strip_prefix("event:")
+                        .is_some_and(|v| v.trim() == "update_session")
+                })
+            {
+                return Ok((id, buf));
+            }
+        }
+    }
+}
+
+/// 消费流（含已有 buf）直到 `event: close`，确认上一个 completion 已完全终止
+async fn wait_close(
+    stream: &mut Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>,
+    buf: &mut Vec<u8>,
+    request_id: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+) -> Result<(), CoreError> {
+    loop {
+        let text = String::from_utf8_lossy(buf);
+        let events: Vec<&str> = text.split("\n\n").collect();
+        let n_complete = if text.ends_with("\n\n") {
+            events.len()
+        } else {
+            events.len().saturating_sub(1)
+        };
+
+        for event in events[..n_complete].iter() {
+            if event.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("event:")
+                    .is_some_and(|v| v.trim() == "close")
+            }) {
+                return Ok(());
+            }
+        }
+
+        // buf 中还没找到 close，继续读流
+        let chunk = stream
+            .next()
+            .await
+            .ok_or_else(|| {
+                CoreError::Stream(format!(
+                    "req={} 分块 {}/{} 流在 close 前结束",
+                    request_id, chunk_index, total_chunks
+                ))
+            })?
+            .map_err(|e| CoreError::Stream(e.to_string()))?;
+        buf.extend_from_slice(&chunk);
+    }
+}
+
+fn parse_json_error(text: &str, request_id: &str) -> CoreError {
+    let raw = text.trim();
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw)
+        && let Some(code) = val.get("code").and_then(|c| c.as_i64())
+    {
+        let msg = val
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        log::error!(
+            target: "ds_core::accounts",
+            "req={} JSON 错误响应: code={}, msg={}", request_id, code, msg
+        );
+        return match code {
+            1001 | 1201 => CoreError::Overloaded,
+            40301 => CoreError::ProviderError(format!("INVALID_POW_RESPONSE: {}", msg)),
+            _ => CoreError::ProviderError(format!("API error code={}: {}", code, msg)),
+        };
+    }
+    log::error!(
+        target: "ds_core::accounts",
+        "req={} 无法解析的响应: {}", request_id, raw.chars().take(200).collect::<String>()
+    );
+    CoreError::Stream(format!(
+        "无法解析的响应: {}",
+        raw.chars().take(200).collect::<String>()
+    ))
 }

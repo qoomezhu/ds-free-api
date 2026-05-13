@@ -226,16 +226,22 @@ impl log::Log for LoggerWrapper {
 }
 
 fn parse_level(s: &str) -> log::LevelFilter {
-    let first = s.split(',').next().unwrap_or(s);
-    let level = first.split('=').next().unwrap_or(first);
-    match level.trim() {
-        "trace" => log::LevelFilter::Trace,
-        "debug" => log::LevelFilter::Debug,
-        "warn" => log::LevelFilter::Warn,
-        "error" => log::LevelFilter::Error,
-        "off" => log::LevelFilter::Off,
-        _ => log::LevelFilter::Info,
+    let mut max_level = log::LevelFilter::Info;
+    for segment in s.split(',') {
+        let level_str = segment.split('=').next_back().unwrap_or(segment).trim();
+        let level = match level_str {
+            "trace" => log::LevelFilter::Trace,
+            "debug" => log::LevelFilter::Debug,
+            "warn" => log::LevelFilter::Warn,
+            "error" => log::LevelFilter::Error,
+            "off" => log::LevelFilter::Off,
+            _ => continue,
+        };
+        if level > max_level {
+            max_level = level;
+        }
     }
+    max_level
 }
 
 /// 查询运行日志（分页，从最新往旧倒序）

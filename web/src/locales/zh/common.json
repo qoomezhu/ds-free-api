@@ -112,6 +112,7 @@
       "typeName": "类型名",
       "maxInput": "最大输入",
       "maxOutput": "最大输出",
+      "inputCharLimit": "输入字符数",
       "alias": "别名（可选）",
       "add": "添加模型类型"
     },

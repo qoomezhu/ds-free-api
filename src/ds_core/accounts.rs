@@ -214,10 +214,10 @@ impl AccountPool {
                 let sem = semaphore.clone();
                 async move {
                     let _permit = sem.acquire().await.expect("信号量未关闭");
-                    let display_id = if creds.mobile.is_empty() {
-                        creds.email.clone()
-                    } else {
+                    let display_id = if creds.email.is_empty() {
                         creds.mobile.clone()
+                    } else {
+                        creds.email.clone()
                     };
                     let account = match init_account(&creds, &client, &solver).await {
                         Ok(account) => {
@@ -261,10 +261,10 @@ impl AccountPool {
         client: &DsClient,
         solver: &PowSolver,
     ) -> Result<String, PoolError> {
-        let display_id = if creds.mobile.is_empty() {
-            creds.email.clone()
-        } else {
+        let display_id = if creds.email.is_empty() {
             creds.mobile.clone()
+        } else {
+            creds.email.clone()
         };
 
         // 检查是否已存在（DashMap O(1) 查找）
@@ -541,10 +541,10 @@ async fn try_init_account(
     );
     let token = login_data.user.token;
 
-    let display_id = if creds.mobile.is_empty() {
-        &creds.email
-    } else {
+    let display_id = if creds.email.is_empty() {
         &creds.mobile
+    } else {
+        &creds.email
     };
 
     // 健康检查：创建临时 session → 发送 test completion → 删除 session

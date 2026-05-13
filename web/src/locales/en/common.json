@@ -112,6 +112,7 @@
       "typeName": "Type Name",
       "maxInput": "Max Input",
       "maxOutput": "Max Output",
+      "inputCharLimit": "Input Chars",
       "alias": "Alias (optional)",
       "add": "Add Model Type"
     },

@@ -18,27 +18,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import tomllib
 from openai import OpenAI
 from anthropic import Anthropic
 
-def load_config() -> dict:
-    """加载 e2e 配置，计算安全并发数、端口和模型列表"""
-    config_path = Path(__file__).parent / "config.toml"
-    if not config_path.exists():
-        print("[警告] 未找到 config.toml，默认配置")
-        return {"accounts": 1, "safe_concurrency": 1, "api_key": "sk-test", "port": 22217, "models": ["deepseek-default"]}
-    with open(config_path, "rb") as f:
-        config = tomllib.load(f)
-    accounts = len(config.get("accounts", []))
-    safe = max(1, accounts // 2)
-    api_keys = config.get("api_keys", [])
-    api_key = api_keys[0]["key"] if api_keys else "sk-test"
-    port = config.get("server", {}).get("port", 22217)
-    # 从 deepseek.model_types 动态生成模型 ID（如 ["default","expert","vision"] → ["deepseek-default","deepseek-expert","deepseek-vision"]）
-    model_types = config.get("deepseek", {}).get("model_types", ["default"])
-    models = [f"deepseek-{t}" for t in model_types]
-    return {"accounts": accounts, "safe_concurrency": safe, "api_key": api_key, "port": port, "models": models}
+from config import load_config
 
 
 def load_scenarios(scenario_dir: str, endpoint: str | None, filter_names: list[str] | None) -> list[dict]:

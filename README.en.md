@@ -61,22 +61,13 @@ The `config/` and `data/` directories are bind-mounted into the container — co
 
 ### Free Test Accounts
 
-All accounts use password `test12345`:
+~~All accounts use password `test12345`:~~
 
 ```text
-debatefeatgdcdve+mclendon@gmail.com
-t.a.ya.hs.c.h.war.z2.5.7@gmail.com
-vsigsiehvdidod+hewitt@gmail.com
-sks.j.hsms.h.sms.n.bv@gmail.com
-slsnvskshevvekeb+berg@gmail.com
-v.s.i.gs.i.ehv.di.d.o.d@gmail.com
-slsnvskshevvekeb+christie@gmail.com
-wa.sh.brom.a.i.1.9.1@gmail.com
+Not stable, no longer provided here. Please register yourself.
 ```
 
-> 💡 Use [emailtick.com](https://www.emailtick.com/en) to quickly create unlimited temporary Gmail accounts.
-> When test accounts get banned, register new ones and replace them.
-> From [issue #62](https://github.com/NIyueeE/ds-free-api/issues/62)
+> You can refer to the method in [issue #62](https://github.com/NIyueeE/ds-free-api/issues/62)
 
 
 ## API Endpoints

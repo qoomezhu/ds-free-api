@@ -76,7 +76,14 @@ impl DeepSeekCore {
                 other => CoreError::ProviderError(other.to_string()),
             })?;
 
-        let completions = crate::ds_core::completions::Completions::new(client, solver, pool).await;
+        let completions = crate::ds_core::completions::Completions::new(
+            client,
+            solver,
+            pool,
+            config.deepseek.model_types.clone(),
+            config.deepseek.input_character_limits.clone(),
+        )
+        .await;
 
         Ok(Self { completions })
     }

@@ -15,9 +15,9 @@ port = 22217
 # jwt_issued_at = 0
 
 # API Key 列表（由管理面板自动管理，部署时无需手动填写）
-# [[api_keys]]
-# key = "sk-xxx"
-# description = "My API Key"
+[[api_keys]]
+key = "sk-test"
+description = "开发测试"
 
 # 邮箱登录示例
 [[accounts]]
@@ -71,6 +71,7 @@ password = "pass3"
 # model_types = ["default", "expert", "vision"]
 # max_input_tokens = [1048576, 1048576, 1048576]
 # max_output_tokens = [384000, 384000, 384000]
+# input_character_limits = [2621440, 163840, 2621440]
 
 # 模型别名（可选，按 index 对齐 model_types，默认无别名）
 # 如 model_types = ["default", "expert"], model_aliases = ["", "deepseek-v4-pro"]

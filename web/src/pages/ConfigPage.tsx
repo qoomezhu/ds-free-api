@@ -492,6 +492,18 @@ export function ConfigPage() {
                   }}
                 />
               </div>
+              <div className="w-24">
+                <label className="text-xs text-muted-foreground">{t('config.modelsSection.inputCharLimit')}</label>
+                <Input
+                  type="number"
+                  value={config.deepseek.input_character_limits[i]}
+                  onChange={(e) => {
+                    const next = [...config.deepseek.input_character_limits];
+                    next[i] = Number(e.target.value);
+                    update(['deepseek', 'input_character_limits'], next);
+                  }}
+                />
+              </div>
               <div className="flex-1 min-w-[120px]">
                 <label className="text-xs text-muted-foreground">{t('config.modelsSection.alias')}</label>
                 <Input
@@ -514,6 +526,10 @@ export function ConfigPage() {
                     ['deepseek', 'max_output_tokens'],
                     config.deepseek.max_output_tokens.filter((_, j) => j !== i),
                   );
+                  update(
+                    ['deepseek', 'input_character_limits'],
+                    config.deepseek.input_character_limits.filter((_, j) => j !== i),
+                  );
                   update(['deepseek', 'model_aliases'], config.deepseek.model_aliases.filter((_, j) => j !== i));
                 }}
               >
@@ -528,6 +544,7 @@ export function ConfigPage() {
               update(['deepseek', 'model_types'], [...config.deepseek.model_types, 'new']);
               update(['deepseek', 'max_input_tokens'], [...config.deepseek.max_input_tokens, 32000]);
               update(['deepseek', 'max_output_tokens'], [...config.deepseek.max_output_tokens, 8000]);
+              update(['deepseek', 'input_character_limits'], [...config.deepseek.input_character_limits, 2621440]);
               update(['deepseek', 'model_aliases'], [...config.deepseek.model_aliases, '']);
             }}
           >

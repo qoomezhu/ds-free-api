@@ -46,6 +46,10 @@ e2e-repair *ARGS:
 e2e-stress *ARGS:
   cd py-e2e-tests && uv run python stress_runner.py "$@"
 
+# Oversized: 长上下文回退方案测试（expert 分块 + default/vision 文件上传）
+e2e-oversized *ARGS:
+  cd py-e2e-tests && uv run python test_oversized.py "$@"
+
 # Start server with e2e test config
 e2e-serve:
   (cd web && bun run build) && cargo run -- -c py-e2e-tests/config.toml

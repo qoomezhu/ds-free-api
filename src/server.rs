@@ -14,6 +14,7 @@ mod stream;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::{
     Json, Router,
     extract::Request,
@@ -144,6 +145,7 @@ fn build_router(state: AppState, cors_origins: Vec<String>) -> Router {
 
     router
         .with_state(state)
+        .layer(DefaultBodyLimit::max(10_000_000))
         .layer(build_cors_layer(&cors_origins))
 }
 

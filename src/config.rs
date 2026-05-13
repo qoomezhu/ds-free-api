@@ -105,6 +105,10 @@ pub struct DeepSeekConfig {
     /// 各模型类型的输出 token 限制（与 model_types 按索引一一对应）
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: Vec<u32>,
+    /// 各模型类型的单次输入字符数限制（与 model_types 按索引一一对应）
+    /// 超过此限制时，expert 模型会触发分块循环写入 session，其他模型会自动退回内联发送
+    #[serde(default = "default_input_character_limits")]
+    pub input_character_limits: Vec<u32>,
     /// 工具调用标签配置（自定义回退标签）
     #[serde(default)]
     pub tool_call: ToolCallTagConfig,
@@ -167,6 +171,7 @@ impl Default for DeepSeekConfig {
             model_types: default_model_types(),
             max_input_tokens: default_max_input_tokens(),
             max_output_tokens: default_max_output_tokens(),
+            input_character_limits: default_input_character_limits(),
             tool_call: ToolCallTagConfig::default(),
             model_aliases: Vec::new(),
         }
@@ -187,6 +192,10 @@ fn default_max_input_tokens() -> Vec<u32> {
 
 fn default_max_output_tokens() -> Vec<u32> {
     vec![384_000, 384_000, 384_000]
+}
+
+fn default_input_character_limits() -> Vec<u32> {
+    vec![2_621_440, 163_840, 2_621_440]
 }
 
 impl DeepSeekConfig {
@@ -357,6 +366,13 @@ impl Config {
             return Err(ConfigError::Validation(format!(
                 "max_output_tokens 长度({})必须与 model_types 长度({})一致",
                 self.deepseek.max_output_tokens.len(),
+                n
+            )));
+        }
+        if self.deepseek.input_character_limits.len() != n {
+            return Err(ConfigError::Validation(format!(
+                "input_character_limits 长度({})必须与 model_types 长度({})一致",
+                self.deepseek.input_character_limits.len(),
                 n
             )));
         }

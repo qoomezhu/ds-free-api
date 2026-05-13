@@ -163,7 +163,7 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
                 sys.insert_str(end, &sys_content);
             }
         } else {
-            parts.insert(0, format!("<｜System｜>{}<｜System｜>\n", sys_content));
+            parts.insert(0, format!("<｜System｜>{}\n", sys_content));
         }
 
         // <think> 中不含工具定义，只含格式规范和调用指令
@@ -194,6 +194,11 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
             );
             parts.push(format!("<｜Assistant｜><think>{}\n", think_reminder));
         }
+    }
+
+    // 确保末尾有 <｜Assistant｜> 供 split_history_prompt 做拆分点
+    if !parts.iter().any(|p| p.starts_with("<｜Assistant｜>")) {
+        parts.push("<｜Assistant｜>\n".to_string());
     }
 
     parts.join("")
