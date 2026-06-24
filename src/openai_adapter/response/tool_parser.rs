@@ -146,7 +146,9 @@ fn parse_complete_xml_tool_tag(
         cursor += 1;
     }
 
-    let name = std::str::from_utf8(&bytes[name_start..cursor]).ok()?.to_string();
+    let name = std::str::from_utf8(&bytes[name_start..cursor])
+        .ok()?
+        .to_string();
     if !tool_names.contains(&name) {
         return None;
     }
@@ -166,11 +168,7 @@ fn parse_complete_xml_tool_tag(
 }
 
 /// 检测文本尾部是否可能是工具标签的前缀（用于流式处理）
-fn get_partial_xml_tool_tag_tail_length(
-    text: &str,
-    tool_names: &[String],
-    closing: bool,
-) -> usize {
+fn get_partial_xml_tool_tag_tail_length(text: &str, tool_names: &[String], closing: bool) -> usize {
     if text.is_empty() || tool_names.is_empty() {
         return 0;
     }
@@ -314,7 +312,8 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
         remaining.push_str(&xml[cursor..open.index]);
 
         // 查找匹配的闭标签
-        let close_tag = find_first_xml_tool_tag(xml, std::slice::from_ref(&open.name), true, open.end_index);
+        let close_tag =
+            find_first_xml_tool_tag(xml, std::slice::from_ref(&open.name), true, open.end_index);
         let Some(close) = close_tag else {
             // 没有闭标签，尝试解析到文本末尾
             let body = &xml[open.end_index..];
@@ -348,9 +347,10 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
 fn parse_tool_call_body(tool_name: &str, body: &str) -> Option<ToolCall> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return Some(make_tool_call(tool_name, serde_json::Value::Object(
-            serde_json::Map::new(),
-        )));
+        return Some(make_tool_call(
+            tool_name,
+            serde_json::Value::Object(serde_json::Map::new()),
+        ));
     }
 
     // 尝试直接解析
@@ -687,32 +687,28 @@ where
                                 buffer.push_str(&content);
                                 let tool_names = &this.tag_config.tool_names;
 
-                                if let Some(open) = find_first_xml_tool_tag(
-                                    buffer,
-                                    tool_names,
-                                    false,
-                                    0,
-                                ) {
+                                if let Some(open) =
+                                    find_first_xml_tool_tag(buffer, tool_names, false, 0)
+                                {
                                     trace!(target: "adapter", ">>> 检测到开标签: name={}, buf_len={}", open.name, buffer.len());
                                     let before = buffer[..open.index].to_string();
-                                    let rest =
-                                        std::mem::take(buffer)[open.end_index..].to_string();
+                                    let rest = std::mem::take(buffer)[open.end_index..].to_string();
                                     *this.state = ToolParseState::Suppressing {
                                         body: rest,
                                         tool_name: open.name,
                                         open_tag: open.raw,
                                     };
-                                    choice.delta.content =
-                                        if before.is_empty() { None } else { Some(before) };
+                                    choice.delta.content = if before.is_empty() {
+                                        None
+                                    } else {
+                                        Some(before)
+                                    };
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
 
                                 // 未找到开标签，检查部分标签尾部
-                                let tail_len = get_partial_xml_tool_tag_tail_length(
-                                    buffer,
-                                    tool_names,
-                                    false,
-                                );
+                                let tail_len =
+                                    get_partial_xml_tool_tag_tail_length(buffer, tool_names, false);
                                 let safe = floor_char_boundary(
                                     buffer,
                                     buffer.len().saturating_sub(tail_len),
@@ -744,12 +740,9 @@ where
 
                                 // 查找闭标签
                                 let single_name = vec![tool_name.clone()];
-                                if let Some(close) = find_first_xml_tool_tag(
-                                    body,
-                                    &single_name,
-                                    true,
-                                    0,
-                                ) {
+                                if let Some(close) =
+                                    find_first_xml_tool_tag(body, &single_name, true, 0)
+                                {
                                     // 先克隆所需字段，再 take body，避免借用冲突
                                     let tool_name_owned = tool_name.clone();
                                     let open_tag_owned = open_tag.clone();
@@ -770,8 +763,7 @@ where
                                         *this.has_tool_calls = true;
                                         choice.delta.content = None;
                                         choice.delta.tool_calls = Some(vec![call]);
-                                        *this.state =
-                                            ToolParseState::Normal { buffer: rest };
+                                        *this.state = ToolParseState::Normal { buffer: rest };
                                         return Poll::Ready(Some(Ok(chunk)));
                                     }
 
@@ -781,10 +773,8 @@ where
                                         "tool_parser 解析失败→请求修复: {}",
                                         tool_name_owned
                                     );
-                                    let tool_text = format!(
-                                        "{}{}{}",
-                                        open_tag_owned, body_content, close.raw
-                                    );
+                                    let tool_text =
+                                        format!("{}{}{}", open_tag_owned, body_content, close.raw);
                                     *this.state = ToolParseState::Normal { buffer: rest };
                                     *this.repair_pending = Some(tool_text);
                                     return Poll::Ready(Some(Ok(chunk)));
@@ -803,9 +793,7 @@ where
                                 if !buffer.is_empty() {
                                     choice.delta.content = Some(std::mem::take(buffer));
                                 }
-                                if *this.has_tool_calls
-                                    && choice.finish_reason == Some("stop")
-                                {
+                                if *this.has_tool_calls && choice.finish_reason == Some("stop") {
                                     choice.finish_reason = Some("tool_calls");
                                 }
                                 *this.finish_emitted = true;
@@ -917,8 +905,7 @@ where
                                 } else {
                                     "stop"
                                 };
-                                let chunk =
-                                    make_end_chunk(this.model, Delta::default(), finish);
+                                let chunk = make_end_chunk(this.model, Delta::default(), finish);
                                 return Poll::Ready(Some(Ok(chunk)));
                             }
                             return Poll::Ready(None);
@@ -938,8 +925,7 @@ where
                                 Some(close) => body[..close.index].to_string(),
                                 None => body,
                             };
-                            if let Some(mut call) =
-                                parse_tool_call_body(&tool_name, &body_content)
+                            if let Some(mut call) = parse_tool_call_body(&tool_name, &body_content)
                             {
                                 debug!(target: "adapter", "tool_parser 流结束时解析出工具调用: {}", tool_name);
                                 call.index = *this.call_index;
@@ -956,8 +942,7 @@ where
                                 return Poll::Ready(Some(Ok(chunk)));
                             }
                             warn!(target: "adapter", "tool_parser 流结束→请求修复");
-                            let tool_text =
-                                format!("{}{}</{}>", open_tag, body_content, tool_name);
+                            let tool_text = format!("{}{}</{}>", open_tag, body_content, tool_name);
                             return Poll::Ready(Some(Err(
                                 OpenAIAdapterError::ToolCallRepairNeeded(tool_text),
                             )));
@@ -1000,7 +985,10 @@ mod tests {
 
     #[test]
     fn parse_tool_call_with_surrounding_text() {
-        let xml = format!("好的，我来查一下。{}", tool("get_weather", r#"{"city": "北京"}"#));
+        let xml = format!(
+            "好的，我来查一下。{}",
+            tool("get_weather", r#"{"city": "北京"}"#)
+        );
         let (calls, remaining) = parse_tool_calls_with(&xml, &cfg(&["get_weather"])).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(remaining, "好的，我来查一下。");
@@ -1013,7 +1001,8 @@ mod tests {
             tool("get_weather", r#"{"city": "北京"}"#),
             tool("get_time", r#"{"tz": "bj"}"#)
         );
-        let (calls, remaining) = parse_tool_calls_with(&xml, &cfg(&["get_weather", "get_time"])).unwrap();
+        let (calls, remaining) =
+            parse_tool_calls_with(&xml, &cfg(&["get_weather", "get_time"])).unwrap();
         assert!(remaining.is_empty());
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].function.as_ref().unwrap().name, "get_weather");
@@ -1084,15 +1073,15 @@ mod tests {
 
     #[test]
     fn parse_tool_call_with_newlines() {
-        let xml = format!("<get_weather>\n{{\"city\": \"北京\"}}\n</get_weather>");
-        let (calls, _) = parse_tool_calls_with(&xml, &cfg(&["get_weather"])).unwrap();
+        let xml = "<get_weather>\n{\"city\": \"北京\"}\n</get_weather>";
+        let (calls, _) = parse_tool_calls_with(xml, &cfg(&["get_weather"])).unwrap();
         assert_eq!(calls.len(), 1);
     }
 
     #[test]
     fn parse_tool_call_with_whitespace_in_tag() {
         let xml = "< get_weather >{\"city\":\"北京\"}</ get_weather >";
-        let (calls, _) = parse_tool_calls_with(&xml, &cfg(&["get_weather"])).unwrap();
+        let (calls, _) = parse_tool_calls_with(xml, &cfg(&["get_weather"])).unwrap();
         assert_eq!(calls.len(), 1);
     }
 
@@ -1103,7 +1092,8 @@ mod tests {
             tool("get_weather", r#"{"city": "北京"}"#),
             tool("get_time", r#"{"tz": "bj"}"#)
         );
-        let (calls, remaining) = parse_tool_calls_with(&xml, &cfg(&["get_weather", "get_time"])).unwrap();
+        let (calls, remaining) =
+            parse_tool_calls_with(&xml, &cfg(&["get_weather", "get_time"])).unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(remaining, "让我先查天气。再查时间。");
     }
@@ -1111,7 +1101,7 @@ mod tests {
     #[test]
     fn parse_invoke_legacy() {
         let xml = r#"<invoke name="get_weather"><parameter name="city" string="true">北京</parameter></invoke>"#;
-        let (calls, _) = parse_tool_calls_with(&xml, &cfg(&["get_weather"])).unwrap();
+        let (calls, _) = parse_tool_calls_with(xml, &cfg(&["get_weather"])).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.as_ref().unwrap().name, "get_weather");
     }
@@ -1136,7 +1126,10 @@ mod tests {
 
     #[test]
     fn repair_backslashes_passes_valid_escapes() {
-        assert_eq!(repair_invalid_backslashes(r#"hello\nworld"#), r#"hello\nworld"#);
+        assert_eq!(
+            repair_invalid_backslashes(r#"hello\nworld"#),
+            r#"hello\nworld"#
+        );
     }
 
     #[test]
@@ -1155,18 +1148,42 @@ mod tests {
     #[test]
     fn partial_tag_detection_open() {
         // 完整的开标签前缀
-        assert!(is_partial_xml_tool_tag("<get_we", &["get_weather".into()], false));
-        assert!(is_partial_xml_tool_tag("<get_weather", &["get_weather".into()], false));
+        assert!(is_partial_xml_tool_tag(
+            "<get_we",
+            &["get_weather".into()],
+            false
+        ));
+        assert!(is_partial_xml_tool_tag(
+            "<get_weather",
+            &["get_weather".into()],
+            false
+        ));
         assert!(is_partial_xml_tool_tag("<", &["get_weather".into()], false));
         // 不匹配的前缀
-        assert!(!is_partial_xml_tool_tag("<unknown", &["get_weather".into()], false));
+        assert!(!is_partial_xml_tool_tag(
+            "<unknown",
+            &["get_weather".into()],
+            false
+        ));
     }
 
     #[test]
     fn partial_tag_detection_close() {
-        assert!(is_partial_xml_tool_tag("</get_we", &["get_weather".into()], true));
-        assert!(is_partial_xml_tool_tag("</get_weather", &["get_weather".into()], true));
-        assert!(!is_partial_xml_tool_tag("<get_we", &["get_weather".into()], true));
+        assert!(is_partial_xml_tool_tag(
+            "</get_we",
+            &["get_weather".into()],
+            true
+        ));
+        assert!(is_partial_xml_tool_tag(
+            "</get_weather",
+            &["get_weather".into()],
+            true
+        ));
+        assert!(!is_partial_xml_tool_tag(
+            "<get_we",
+            &["get_weather".into()],
+            true
+        ));
     }
 
     #[test]

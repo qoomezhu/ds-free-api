@@ -29,10 +29,15 @@ mod tests {
         prompt: String,
         thinking_enabled: bool,
         search_enabled: bool,
-        stream: bool,
+        stream: TestStreamOpts,
+        stop: Vec<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestStreamOpts {
+        enabled: bool,
         include_usage: bool,
         include_obfuscation: bool,
-        stop: Vec<String>,
     }
 
     fn parse_json(val: serde_json::Value) -> Result<TestRequest, OpenAIAdapterError> {
@@ -90,9 +95,11 @@ mod tests {
             prompt,
             thinking_enabled: model_res.thinking_enabled,
             search_enabled: model_res.search_enabled,
-            stream: req.stream,
-            include_usage: norm.include_usage,
-            include_obfuscation: norm.include_obfuscation,
+            stream: TestStreamOpts {
+                enabled: req.stream,
+                include_usage: norm.include_usage,
+                include_obfuscation: norm.include_obfuscation,
+            },
             stop: norm.stop,
         })
     }
@@ -293,9 +300,9 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         }))
         .unwrap();
-        assert_eq!(req.stream, false);
-        assert_eq!(req.include_usage, false);
-        assert_eq!(req.include_obfuscation, true);
+        assert!(!req.stream.enabled);
+        assert!(!req.stream.include_usage);
+        assert!(req.stream.include_obfuscation);
 
         // 显式覆盖
         let req2 = parse_json(serde_json::json!({
@@ -304,8 +311,8 @@ mod tests {
             "stream_options": { "include_usage": true, "include_obfuscation": false }
         }))
         .unwrap();
-        assert_eq!(req2.include_usage, true);
-        assert_eq!(req2.include_obfuscation, false);
+        assert!(req2.stream.include_usage);
+        assert!(!req2.stream.include_obfuscation);
     }
 
     // tools 校验与注入
@@ -413,7 +420,10 @@ mod tests {
             "tool_choice": { "type": "custom", "custom": { "name": "my_custom" } }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.prompt.contains("### Tool my_custom (custom, format: text)"));
+        assert!(
+            req.prompt
+                .contains("### Tool my_custom (custom, format: text)")
+        );
         assert!(req.prompt.contains("你必须调用 'my_custom' 自定义工具"));
     }
 
@@ -520,10 +530,7 @@ mod tests {
         let req = parse_json(body).unwrap();
         let prompt = &req.prompt;
         // 工具定义应注入到 System 消息中（或创建 System 消息）
-        assert!(
-            prompt.contains("## Tools"),
-            "工具定义应包含 ## Tools 标题"
-        );
+        assert!(prompt.contains("## Tools"), "工具定义应包含 ## Tools 标题");
         assert!(prompt.contains("### Tool calc"));
         assert!(prompt.contains("calc"));
         // 不应包含旧的 <think> 注入前缀

@@ -585,33 +585,26 @@ mod tests {
         let mut has_content = false;
 
         for (content, frag_type) in pieces {
-            match *frag_type {
-                "THINK" => {
-                    if !has_think {
-                        events.push(StreamEvent::ThinkStart);
-                        has_think = true;
-                    }
-                    events.push(StreamEvent::ThinkDelta {
-                        content: content.to_string(),
-                    });
+            if *frag_type == "THINK" {
+                if !has_think {
+                    events.push(StreamEvent::ThinkStart);
+                    has_think = true;
                 }
-                _ => {
-                    if !has_content {
-                        events.push(StreamEvent::ContentStart);
-                        has_content = true;
-                    }
-                    events.push(StreamEvent::ContentDelta {
-                        content: content.to_string(),
-                    });
+                events.push(StreamEvent::ThinkDelta {
+                    content: content.to_string(),
+                });
+            } else {
+                if !has_content {
+                    events.push(StreamEvent::ContentStart);
+                    has_content = true;
                 }
+                events.push(StreamEvent::ContentDelta {
+                    content: content.to_string(),
+                });
             }
         }
 
-        let finish = if has_content {
-            Some("stop".to_string())
-        } else {
-            None
-        };
+        let finish = has_content.then(|| "stop".to_string());
         events.push(StreamEvent::Done {
             finish_reason: finish,
             accumulated_token_usage: usage_tokens,
@@ -801,7 +794,7 @@ mod tests {
             .find(|c| c["usage"]["completion_tokens"].as_i64() == Some(12));
         assert!(usage_chunk.is_some(), "should have usage chunk");
         let finish_chunk = chunks.iter().rev().find(|c| {
-            c["choices"].as_array().map_or(false, |a| !a.is_empty())
+            c["choices"].as_array().is_some_and(|a| !a.is_empty())
                 && c["choices"][0]["finish_reason"].as_str().is_some()
         });
         assert_eq!(finish_chunk.unwrap()["choices"][0]["finish_reason"], "stop");
@@ -1048,7 +1041,7 @@ mod tests {
                 );
                 let len = serde_json::to_string(c).unwrap().len();
                 assert!(
-                    len >= 490 && len <= 530,
+                    (490..=530).contains(&len),
                     "chunk len {} out of expected 490..=530 range",
                     len
                 );

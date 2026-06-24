@@ -242,8 +242,7 @@ mod tests {
             msg.content[1],
             ResponseContentBlock::ToolUse { .. }
         ));
-        if let ResponseContentBlock::ToolUse { ref input, .. } =
-            msg.content[usize::from(msg.content.len() - 1)]
+        if let ResponseContentBlock::ToolUse { ref input, .. } = msg.content[msg.content.len() - 1]
         {
             assert_eq!(input["city"], "Beijing");
         }

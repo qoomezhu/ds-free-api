@@ -53,10 +53,7 @@ pub(crate) fn extract(req: &ChatCompletionsRequest) -> Result<ToolContext, Strin
             build_allowed_tools_instruction(allowed_tools, &mut instruction_lines);
         }
         ToolChoice::Named(named) => {
-            instruction_lines.push(format!(
-                "注意：你必须调用 '{}' 工具。",
-                named.function.name
-            ));
+            instruction_lines.push(format!("注意：你必须调用 '{}' 工具。", named.function.name));
         }
         ToolChoice::Custom(custom) => {
             instruction_lines.push(format!(
@@ -232,10 +229,8 @@ fn example_payload(name: &str) -> String {
         "Write" | "write_to_file" => {
             r#"{"file_path": "/path/to/file", "content": "hello"}"#.to_string()
         }
-        "Edit" => {
-            r#"{"file_path": "/path/to/file", "old_string": "foo", "new_string": "bar"}"#
-                .to_string()
-        }
+        "Edit" => r#"{"file_path": "/path/to/file", "old_string": "foo", "new_string": "bar"}"#
+            .to_string(),
         "Glob" => r#"{"pattern": "**/*.rs", "path": "."}"#.to_string(),
         "search_files" => r#"{"query": "TODO", "path": "."}"#.to_string(),
         "get_weather" => r#"{"city": "Beijing"}"#.to_string(),
