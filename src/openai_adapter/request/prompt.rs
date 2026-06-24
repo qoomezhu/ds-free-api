@@ -1,11 +1,10 @@
 //! Prompt 构建 —— 将 OpenAI messages 转换为 DeepSeek 原生标签格式
 //!
 //! 使用 `<｜System｜>`、`<｜User｜>`、`<｜Assistant｜>`、`<｜tool▁outputs▁begin｜>` 作为角色标记。
-//! 若请求包含工具定义或行为指令，会嵌入到最后一个 `<｜Assistant｜>` 后的
-//! 不闭合 `<think>` 块中，确保工具上下文始终紧邻模型生成位置。
+//! 工具定义以对话式自然语言注入到 System 消息中，工具调用使用 per-tool XML 标签格式
+//! `<tool_name>{json}</tool_name>`。
 
 use super::tools::ToolContext;
-use crate::openai_adapter::response::{TOOL_CALL_END, TOOL_CALL_START};
 use crate::openai_adapter::types::{ChatCompletionsRequest, ContentPart, Message, MessageContent};
 
 /// 合并连续相同 role 的 message，避免 DeepSeek 模型对连续同角色标签产生混淆
@@ -97,7 +96,9 @@ fn format_response_text(rf: &crate::openai_adapter::types::ResponseFormat) -> St
 }
 
 /// 构建 DeepSeek 原生标签格式的 prompt 字符串
-/// 顺序: [system(含 reminder)] [历史 user/tool/assistant 轮次...] <｜Assistant｜><think>[reminder]
+///
+/// 工具定义和调用指令以自然语言注入到 System 消息尾部，
+/// 不再使用 `<think>` 块注入和"嗯，我刚刚被系统提醒"前缀。
 pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> String {
     let messages = merge_messages(&req.messages);
     let mut parts: Vec<String> = Vec::with_capacity(messages.len());
@@ -125,74 +126,37 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
         }
     }
 
-    let mut tool_sections: Vec<String> = Vec::new();
+    // 收集工具和格式相关的注入内容
+    let mut sections: Vec<String> = Vec::new();
 
-    if let Some(text) = tool_ctx.format_block.as_deref() {
-        tool_sections.push(format!("### 格式规范\n{}", text));
-    }
     if let Some(text) = tool_ctx.defs_text.as_deref() {
-        tool_sections.push(format!("### 工具定义\n{}", text));
+        sections.push(format!("## Tools\n\n{text}\n\n使用工具时，请直接输出对应工具的 XML 标签（如 `<tool_name>{{...}}</tool_name>`）。不要使用 `<invoke name=\"...\">...</invoke>` 或 `<tool_call>...</tool_call>` 等包装格式。"));
     }
     if let Some(text) = tool_ctx.instruction_text.as_deref() {
-        tool_sections.push(format!("### 调用指令\n{}", text));
+        sections.push(format!("## 调用指令\n{text}"));
     }
 
-    let mut reminder_parts: Vec<String> = Vec::new();
-
-    if !tool_sections.is_empty() {
-        reminder_parts.push(format!("## 工具调用\n{}", tool_sections.join("\n\n")));
-    }
-
-    // response_format 降级：将格式约束注入到 <arg_key> 块中
+    // response_format 降级
     let format_text = req
         .response_format
         .as_ref()
         .map(format_response_text)
         .unwrap_or_default();
     if !format_text.is_empty() {
-        reminder_parts.push(format!("## 输出格式\n{}", format_text));
+        sections.push(format!("## 输出格式\n{format_text}"));
     }
 
-    if !reminder_parts.is_empty() {
-        let reminder_body = reminder_parts.join("\n\n");
-
-        // System 尾部注入完整 reminder（不含"嗯"前缀，含工具定义）
-        let sys_content = format!("\n\n{}", reminder_body);
+    // 将工具和格式内容注入到 System 消息尾部
+    if !sections.is_empty() {
+        let injection = format!("\n\n{}", sections.join("\n\n"));
         if let Some(sys) = parts.iter_mut().find(|p| p.starts_with("<｜System｜>")) {
             if let Some(end) = sys.rfind('\n') {
-                sys.insert_str(end, &sys_content);
+                sys.insert_str(end, &injection);
+            } else {
+                sys.push_str(&injection);
             }
         } else {
-            parts.insert(0, format!("<｜System｜>{}\n", sys_content));
-        }
-
-        // <think> 中不含工具定义，只含格式规范和调用指令
-        let mut think_sections: Vec<String> = Vec::new();
-        if let Some(text) = tool_ctx.format_block.as_deref() {
-            think_sections.push(format!("### 格式规范\n{}", text));
-        }
-        if let Some(text) = tool_ctx.instruction_text.as_deref() {
-            think_sections.push(format!("### 调用指令\n{}", text));
-        }
-        let mut think_parts: Vec<String> = Vec::new();
-        if !think_sections.is_empty() {
-            think_parts.push(format!("## 工具调用\n{}", think_sections.join("\n\n")));
-        }
-        // response_format only in think
-        let think_format_text = req
-            .response_format
-            .as_ref()
-            .map(format_response_text)
-            .unwrap_or_default();
-        if !think_format_text.is_empty() {
-            think_parts.push(format!("## 输出格式\n{}", think_format_text));
-        }
-        if !think_parts.is_empty() {
-            let think_reminder = format!(
-                "嗯，我刚刚被系统提醒需要遵循以下内容:\n\n{}",
-                think_parts.join("\n\n")
-            );
-            parts.push(format!("<｜Assistant｜><think>{}\n", think_reminder));
+            parts.insert(0, format!("<｜System｜>{}\n", injection.trim_start()));
         }
     }
 
@@ -248,35 +212,22 @@ fn format_assistant(msg: &Message) -> String {
     if let Some(content) = &msg.content {
         parts.push(format_content(content));
     }
+    // 工具调用使用 per-tool XML 标签格式
     if let Some(tool_calls) = &msg.tool_calls {
-        let items: Vec<String> = tool_calls
-            .iter()
-            .filter_map(|tc| {
-                tc.function.as_ref().map(|func| {
-                    let args = serde_json::from_str::<serde_json::Value>(&func.arguments)
-                        .unwrap_or(serde_json::Value::Null);
-                    format!(
-                        "{{\"name\": {}, \"arguments\": {}}}",
-                        serde_json::to_string(&func.name).unwrap_or_else(|_| "\"\"".into()),
-                        serde_json::to_string(&args).unwrap_or_else(|_| "null".into()),
-                    )
-                })
-            })
-            .collect();
-        parts.push(format!(
-            "{TOOL_CALL_START}\n[{}]\n{TOOL_CALL_END}",
-            items.join(", ")
-        ));
+        for tc in tool_calls {
+            if let Some(func) = &tc.function {
+                let args = serde_json::from_str::<serde_json::Value>(&func.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "null".into());
+                parts.push(format!("<{}>\n{}\n</{}>", func.name, args_str, func.name));
+            }
+        }
     }
     if let Some(fc) = &msg.function_call {
         let args = serde_json::from_str::<serde_json::Value>(&fc.arguments)
             .unwrap_or(serde_json::Value::Null);
-        let item = format!(
-            "{{\"name\": {}, \"arguments\": {}}}",
-            serde_json::to_string(&fc.name).unwrap_or_else(|_| "\"\"".into()),
-            serde_json::to_string(&args).unwrap_or_else(|_| "null".into()),
-        );
-        parts.push(format!("{TOOL_CALL_START}\n[{item}]\n{TOOL_CALL_END}"));
+        let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "null".into());
+        parts.push(format!("<{}>\n{}\n</{}>", fc.name, args_str, fc.name));
     }
     if let Some(refusal) = &msg.refusal {
         parts.push(format!("(refusal: {refusal})"));

@@ -155,8 +155,7 @@ export interface ServerConfig {
 }
 
 export interface ToolCallTagConfig {
-  extra_starts: string[];
-  extra_ends: string[];
+  extra_tool_names: string[];
 }
 
 export interface AccountEntry {

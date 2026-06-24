@@ -7,7 +7,7 @@
 mod converter;
 mod tool_parser;
 
-pub(crate) use tool_parser::{TOOL_CALL_END, TOOL_CALL_START, TagConfig};
+pub(crate) use tool_parser::TagConfig;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -115,29 +115,19 @@ pub(crate) async fn execute_tool_repair(
         }
     }
 
-    let wrapped = if tool_parser::contains_start_tag_with(&text, tag_config) {
-        text.trim().to_string()
-    } else {
-        format!(
-            "{}{}{}",
-            tool_parser::TOOL_CALL_START,
-            text.trim(),
-            tool_parser::TOOL_CALL_END
-        )
-    };
+    let trimmed = text.trim();
+    if trimmed == "[]" || trimmed == "{}" {
+        return Err(OpenAIAdapterError::Internal("修复模型返回空结果".into()));
+    }
 
-    let (calls, _) = tool_parser::parse_tool_calls_with(&wrapped, tag_config).ok_or_else(|| {
+    // 修复模型应输出 per-tool XML 标签格式，直接解析
+    let (calls, _) = tool_parser::parse_tool_calls_with(&text, tag_config).ok_or_else(|| {
         OpenAIAdapterError::Internal(format!(
             "修复模型返回无法解析为工具调用: {}",
             &text[..text.len().min(200)]
         ))
     })?;
 
-    // 修复模型可能返回空结果，提前检查
-    let trimmed = text.trim();
-    if trimmed == "[]" || trimmed == "{}" {
-        return Err(OpenAIAdapterError::Internal("修复模型返回空结果".into()));
-    }
     Ok(calls)
 }
 
@@ -570,16 +560,20 @@ mod tests {
     use super::*;
 
     fn default_tag_config() -> Arc<TagConfig> {
-        Arc::new(TagConfig::from_config(&Default::default()))
+        // 测试用的 TagConfig，包含测试中用到的所有工具名
+        Arc::new(TagConfig {
+            tool_names: vec![
+                "get_weather".into(),
+                "f".into(),
+                "astrbot_execute_shell".into(),
+                "get_time".into(),
+            ],
+        })
     }
 
-    fn tool_span(content: &str) -> String {
-        format!(
-            "{}{}{}",
-            tool_parser::TOOL_CALL_START,
-            content,
-            tool_parser::TOOL_CALL_END
-        )
+    /// 生成 per-tool XML 格式的工具调用文本
+    fn tool_span(name: &str, args: &str) -> String {
+        format!("<{name}>{args}</{name}>")
     }
 
     fn make_event_stream(
@@ -693,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_tool_calls() {
-        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
+        let tool_xml = tool_span("get_weather", r#"{"city": "beijing"}"#);
         let events = make_full_stream(&[(&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(events);
         let resp = aggregate(
@@ -815,7 +809,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls() {
-        let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
+        let tool_xml = tool_span("f", r#"{}"#);
         let events = make_full_stream(&[(&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(events);
         let chunks = collect_chunks(to_bytes_stream(super::stream(
@@ -842,7 +836,7 @@ mod tests {
             .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
             .collect();
         assert!(
-            !all_content.contains(tool_parser::TOOL_CALL_START),
+            !all_content.contains("<f>"),
             "content should not contain tool_calls tags"
         );
         assert_eq!(
@@ -853,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_fragmented_tool_calls_with_thinking() {
-        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "北京"}}]"#);
+        let tool_xml = tool_span("get_weather", r#"{"city": "北京"}"#);
         let events = make_full_stream(&[("思考中", "THINK"), (&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(events);
         let chunks = collect_chunks(to_bytes_stream(super::stream(
@@ -899,7 +893,8 @@ mod tests {
     #[tokio::test]
     async fn stream_tool_calls_with_leading_text_fragmented() {
         let tool_xml = tool_span(
-            r#"[{"name": "astrbot_execute_shell", "arguments": {"command": "cat /data/astrbot/skills/doubao-image-gen/SKILL.md"}}]"#,
+            "astrbot_execute_shell",
+            r#"{"command": "cat /data/astrbot/skills/doubao-image-gen/SKILL.md"}"#,
         );
         let events = make_full_stream(
             &[
@@ -951,7 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_no_leading_text() {
-        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
+        let tool_xml = tool_span("get_weather", r#"{"city": "beijing"}"#);
         let events = make_full_stream(&[(&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(events);
         let chunks = collect_chunks(to_bytes_stream(super::stream(
@@ -1075,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_tool_calls_with_leading_text() {
-        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
+        let tool_xml = tool_span("get_weather", r#"{"city": "beijing"}"#);
         let events = make_full_stream(
             &[("好的，我来帮你。", "RESPONSE"), (&tool_xml, "RESPONSE")],
             None,
@@ -1109,7 +1104,7 @@ mod tests {
 
     #[tokio::test]
     async fn aggregate_tool_calls_multi_chunk_fragments() {
-        let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
+        let tool_xml = tool_span("f", r#"{}"#);
         let events = make_full_stream(
             &[("让我来查一下。", "RESPONSE"), (&tool_xml, "RESPONSE")],
             None,
@@ -1138,7 +1133,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_with_thinking_then_leading_text_then_fragmented_json() {
-        let tool_xml = tool_span(r#"[{"name": "get_weather", "arguments": {"city": "beijing"}}]"#);
+        let tool_xml = tool_span("get_weather", r#"{"city": "beijing"}"#);
         let events = make_full_stream(
             &[
                 ("用户要查天气，我需要调用工具", "THINK"),
@@ -1171,7 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_tool_calls_json_split_right_after_tag() {
-        let tool_xml = tool_span(r#"[{"name": "f", "arguments": {}}]"#);
+        let tool_xml = tool_span("f", r#"{}"#);
         let events = make_full_stream(&[("好的。", "RESPONSE"), (&tool_xml, "RESPONSE")], None);
         let stream = futures::stream::iter(events);
         let chunks = collect_chunks(to_bytes_stream(super::stream(

@@ -134,42 +134,18 @@ pub struct ProxyConfig {
 }
 
 /// 工具调用标签配置
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ToolCallTagConfig {
-    /// 额外开始标签（内置 `<|tool▁calls▁begin|>` + 模糊匹配，此处只加格式完全不同的变体）
-    #[serde(default = "default_tool_call_starts")]
-    pub extra_starts: Vec<String>,
-    /// 额外结束标签（内置 `<|tool▁calls▁end|>` + 模糊匹配，此处只加格式完全不同的变体）
-    #[serde(default = "default_tool_call_ends")]
-    pub extra_ends: Vec<String>,
-}
-
-impl Default for ToolCallTagConfig {
-    fn default() -> Self {
-        Self {
-            extra_starts: default_tool_call_starts(),
-            extra_ends: default_tool_call_ends(),
-        }
-    }
+    /// 额外工具名（除了请求中 tools 定义的工具名之外，额外可识别的工具名）
+    ///
+    /// per-tool XML 标签策略：每个工具使用独立标签 `<tool_name>{json}</tool_name>`，
+    /// 标签名即工具名。此处配置的额外工具名会与请求中的工具名合并，
+    /// 用于识别模型可能输出的、未在请求 tools 中定义的工具标签。
+    #[serde(default)]
+    pub extra_tool_names: Vec<String>,
 }
 
 // ── 默认值函数 ──────────────────────────────────────────────────────────
-
-fn default_tool_call_starts() -> Vec<String> {
-    vec![
-        "<|tool_call_begin|>".into(),
-        "<tool_calls>".into(),
-        "<tool_call>".into(),
-    ]
-}
-
-fn default_tool_call_ends() -> Vec<String> {
-    vec![
-        "<|tool_call_end|>".into(),
-        "</tool_calls>".into(),
-        "</tool_call>".into(),
-    ]
-}
 
 fn default_model_types() -> Vec<String> {
     vec![

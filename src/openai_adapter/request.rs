@@ -324,7 +324,7 @@ mod tests {
             "tool_choice": "none"
         });
         let req = parse_json(body).unwrap();
-        assert!(!req.prompt.contains("你可以使用以下工具"));
+        assert!(!req.prompt.contains("## Tools"));
     }
 
     #[test]
@@ -413,7 +413,7 @@ mod tests {
             "tool_choice": { "type": "custom", "custom": { "name": "my_custom" } }
         });
         let req = parse_json(body).unwrap();
-        assert!(req.prompt.contains("**my_custom** (custom):"));
+        assert!(req.prompt.contains("### Tool my_custom (custom, format: text)"));
         assert!(req.prompt.contains("你必须调用 'my_custom' 自定义工具"));
     }
 
@@ -456,7 +456,7 @@ mod tests {
             ]
         });
         let req = parse_json(body).unwrap();
-        assert!(req.prompt.contains("调用方法:"));
+        assert!(req.prompt.contains("Valid call format for no_format:"));
         assert!(req.prompt.contains("无约束"));
     }
 
@@ -502,10 +502,10 @@ mod tests {
         assert!(matches!(err, OpenAIAdapterError::BadRequest(_)));
     }
 
-    // tools injection 位置：嵌入到最后一个 <｜Assistant｜> 后的 <think> 块中
+    // tools injection 位置：注入到 System 消息尾部
 
     #[test]
-    fn tools_injected_into_think_block() {
+    fn tools_injected_into_system_message() {
         let body = serde_json::json!({
             "model": "deepseek-default",
             "messages": [
@@ -519,19 +519,17 @@ mod tests {
         });
         let req = parse_json(body).unwrap();
         let prompt = &req.prompt;
-        // 工具定义应注入到最后一个 <｜Assistant｜><think> 块中
+        // 工具定义应注入到 System 消息中（或创建 System 消息）
         assert!(
-            prompt.contains("<｜Assistant｜><think>嗯，我刚刚被系统提醒需要遵循以下内容:"),
-            "工具定义应注入到 <think> 块中"
+            prompt.contains("## Tools"),
+            "工具定义应包含 ## Tools 标题"
         );
-        assert!(prompt.contains("## 工具调用"));
+        assert!(prompt.contains("### Tool calc"));
         assert!(prompt.contains("calc"));
-        // <think> 块应在最后，位于最后的 user 消息之后
-        let think_pos = prompt.find("<｜Assistant｜><think>").unwrap();
-        let last_user_pos = prompt.rfind("第二个问题").unwrap();
+        // 不应包含旧的 <think> 注入前缀
         assert!(
-            think_pos > last_user_pos,
-            "<think> 块应在最后的 user 消息之后"
+            !prompt.contains("嗯，我刚刚被系统提醒"),
+            "不应使用旧的 think 块注入前缀"
         );
     }
 
@@ -553,7 +551,7 @@ mod tests {
         });
         let req = parse_json(body).unwrap();
         assert!(req.prompt.contains("get_weather"));
-        assert!(req.prompt.contains("你可以使用以下工具"));
+        assert!(req.prompt.contains("### Tool get_weather"));
     }
 
     #[test]

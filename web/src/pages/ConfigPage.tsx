@@ -556,15 +556,15 @@ export function ConfigPage() {
       <Section title={t('config.sections.toolCallTags')} icon={Tags}>
         <div className="space-y-4">
           <div>
-            <label className="text-sm text-muted-foreground block mb-1">{t('config.toolCallTags.extraStarts')}</label>
+            <label className="text-sm text-muted-foreground block mb-1">{t('config.toolCallTags.extraToolNames')}</label>
             <div className="flex flex-wrap gap-2">
-              {config.ds_core.tool_call.extra_starts.map((tag, i) => (
+              {config.ds_core.tool_call.extra_tool_names.map((name, i) => (
                 <Badge key={i} variant="secondary" className="gap-1">
-                  {tag}
+                  {name}
                   <button
                     onClick={() => {
-                      const next = config.ds_core.tool_call.extra_starts.filter((_, j) => j !== i);
-                      update(['ds_core', 'tool_call', 'extra_starts'], next);
+                      const next = config.ds_core.tool_call.extra_tool_names.filter((_, j) => j !== i);
+                      update(['ds_core', 'tool_call', 'extra_tool_names'], next);
                     }}
                   >
                     <X className="h-3 w-3" />
@@ -573,42 +573,11 @@ export function ConfigPage() {
               ))}
               <Input
                 className="w-48 h-8 text-xs"
-                placeholder="新标签，回车添加"
+                placeholder="新工具名，回车添加"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && e.currentTarget.value.trim()) {
-                    update(['ds_core', 'tool_call', 'extra_starts'], [
-                      ...config.ds_core.tool_call.extra_starts,
-                      e.currentTarget.value.trim(),
-                    ]);
-                    e.currentTarget.value = '';
-                  }
-                }}
-              />
-            </div>
-          </div>
-          <div>
-            <label className="text-sm text-muted-foreground block mb-1">{t('config.toolCallTags.extraEnds')}</label>
-            <div className="flex flex-wrap gap-2">
-              {config.ds_core.tool_call.extra_ends.map((tag, i) => (
-                <Badge key={i} variant="secondary" className="gap-1">
-                  {tag}
-                  <button
-                    onClick={() => {
-                      const next = config.ds_core.tool_call.extra_ends.filter((_, j) => j !== i);
-                      update(['ds_core', 'tool_call', 'extra_ends'], next);
-                    }}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                </Badge>
-              ))}
-              <Input
-                className="w-48 h-8 text-xs"
-                placeholder="新标签，回车添加"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && e.currentTarget.value.trim()) {
-                    update(['ds_core', 'tool_call', 'extra_ends'], [
-                      ...config.ds_core.tool_call.extra_ends,
+                    update(['ds_core', 'tool_call', 'extra_tool_names'], [
+                      ...config.ds_core.tool_call.extra_tool_names,
                       e.currentTarget.value.trim(),
                     ]);
                     e.currentTarget.value = '';

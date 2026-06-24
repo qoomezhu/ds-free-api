@@ -60,11 +60,11 @@ port = 22217
 # model_aliases = []
 
 # 工具调用标签配置
-# 内置模糊匹配：全角 `｜`(U+FF5C) 与 `▁`(U+2581) 分别等价于 ASCII `|` 和 `_`，
-# 自动覆盖大多数字符级幻觉变体。
-# extra 用于格式完全不同的回退标签（如 <tool_call>）：
-# tool_call.extra_starts = ["<|tool_call_begin|>", "<tool_calls>", "<tool_call>"]
-# tool_call.extra_ends = ["<|tool_call_end|>", "</tool_calls>", "</tool_call>"]
+# 采用 per-tool XML 标签策略：每个工具使用独立标签 `<tool_name>{json}</tool_name>`，
+# 标签名即工具名（从请求的 tools 定义中自动提取）。
+# extra_tool_names 用于配置额外的可识别工具名（未在请求 tools 中定义，
+# 但模型可能输出的工具标签名）。
+# tool_call.extra_tool_names = ["custom_tool_a", "custom_tool_b"]
 
 # Admin 配置（由管理面板自动管理，部署时无需手动填写）
 # [admin]

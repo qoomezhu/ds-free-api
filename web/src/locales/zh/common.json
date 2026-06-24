@@ -117,9 +117,8 @@
       "add": "添加模型类型"
     },
     "toolCallTags": {
-      "extraStarts": "额外开始标签",
-      "extraEnds": "额外结束标签",
-      "placeholder": "新标签，回车添加"
+      "extraToolNames": "额外工具名",
+      "placeholder": "新工具名，回车添加"
     },
     "proxy": {
       "url": "代理 URL（留空禁用）",

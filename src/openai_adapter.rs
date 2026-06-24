@@ -193,8 +193,14 @@ impl OpenAIAdapter {
                 .join("\n")
         });
 
+        // 从请求的工具定义 + 配置的额外工具名构建 TagConfig
+        let extra_tool_names = &self.tag_config.read().await.tool_names;
+        let tag_config = Arc::new(response::TagConfig::from_request(&req, extra_tool_names));
+
         if req.stream {
-            let repair_fn = self.create_repair_fn(request_id, tool_defs.clone()).await;
+            let repair_fn = self
+                .create_repair_fn(request_id, tool_defs.clone(), tag_config.clone())
+                .await;
             let s = response::stream(
                 event_stream,
                 req.model,
@@ -204,7 +210,7 @@ impl OpenAIAdapter {
                     stop: norm.stop,
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
-                    tag_config: self.tag_config.read().await.clone(),
+                    tag_config: tag_config.clone(),
                 },
             );
             Ok(ChatResult {
@@ -213,7 +219,9 @@ impl OpenAIAdapter {
                 prompt_tokens,
             })
         } else {
-            let repair_fn = self.create_repair_fn(request_id, tool_defs).await;
+            let repair_fn = self
+                .create_repair_fn(request_id, tool_defs, tag_config.clone())
+                .await;
             let json = response::aggregate(
                 event_stream,
                 req.model,
@@ -223,7 +231,7 @@ impl OpenAIAdapter {
                     stop: norm.stop,
                     prompt_tokens,
                     repair_fn: Some(repair_fn),
-                    tag_config: self.tag_config.read().await.clone(),
+                    tag_config: tag_config.clone(),
                 },
             )
             .await?;
@@ -492,12 +500,12 @@ impl OpenAIAdapter {
         &self,
         request_id: &str,
         tool_defs: Option<String>,
+        tag_config: Arc<response::TagConfig>,
     ) -> response::RepairFn {
         use std::sync::atomic::{AtomicU16, Ordering};
         let core = self.ds_core.clone();
         let req_id = request_id.to_string();
         let seq = Arc::new(AtomicU16::new(0));
-        let tag_config = self.tag_config.read().await.clone();
         let tools_info = tool_defs.unwrap_or_default();
         Arc::new(move |tool_text: String| {
             let core = core.clone();
@@ -514,9 +522,10 @@ impl OpenAIAdapter {
                     prompt.push_str(&format!("可用的工具定义：\n{}\n\n", tools_info));
                 }
                 prompt.push_str(&format!(
-                    "请将以下代码块中的内容提取并转换为合法的工具调用 JSON 数组。\
-                     \n每个元素必须包含 \"name\"（字符串）和 \"arguments\"（对象）字段。\
-                     \n只输出 JSON 数组本身，不要加 code fence，不要其他文字解释。\
+                    "请将以下内容提取并转换为合法的工具调用。\
+                     \n每个工具调用使用独立的 XML 标签格式：`<tool_name>{{\"参数名\": \"参数值\"}}</tool_name>`。\
+                     \n标签名即工具名，标签体为 JSON 参数对象。\
+                     \n只输出工具调用标签本身，不要加 code fence，不要其他文字解释。\
                      \n注意：字符串值中的引号和换行符必须用反斜杠转义（如 \\\" 和 \\n）。\
                      \n\n需要修复的内容：\n~~~\n{tool_text}\n~~~"
                 ));
@@ -560,7 +569,7 @@ pub enum OpenAIAdapterError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// tool_calls 标记解析失败，携带 `{TOOL_CALL_START}...{TOOL_CALL_END}` 内的原始文本
+    /// tool_calls 标记解析失败，携带 `<tool_name>...</tool_name>` 内的原始文本
     #[error("tool_calls repair needed: {0}")]
     ToolCallRepairNeeded(String),
 }

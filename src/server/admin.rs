@@ -79,8 +79,7 @@ pub struct ServerConfigView {
 
 #[derive(Serialize)]
 pub struct ToolCallTagConfigView {
-    pub extra_starts: Vec<String>,
-    pub extra_ends: Vec<String>,
+    pub extra_tool_names: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -140,8 +139,7 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
             input_character_limits: config.ds_core.input_character_limits.clone(),
             model_aliases: config.ds_core.model_aliases.clone(),
             tool_call: ToolCallTagConfigView {
-                extra_starts: config.ds_core.tool_call.extra_starts.clone(),
-                extra_ends: config.ds_core.tool_call.extra_ends.clone(),
+                extra_tool_names: config.ds_core.tool_call.extra_tool_names.clone(),
             },
         },
         proxy: ProxyConfigView {

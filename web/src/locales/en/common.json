@@ -117,9 +117,8 @@
       "add": "Add Model Type"
     },
     "toolCallTags": {
-      "extraStarts": "Extra Start Tags",
-      "extraEnds": "Extra End Tags",
-      "placeholder": "New tag, press Enter to add"
+      "extraToolNames": "Extra Tool Names",
+      "placeholder": "New tool name, press Enter to add"
     },
     "proxy": {
       "url": "Proxy URL (leave empty to disable)",

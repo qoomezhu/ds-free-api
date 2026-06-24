@@ -36,8 +36,92 @@
 - **效果意外很好**, 模型识别和遵循度明显提升, 幻觉也大幅减少
 - 可能原因是 tokenizer 对 `<|...|>` 格式有已有的 token 模式, 模型对这个"结构模板"有更好的遵循倾向
 
-**当前策略: 实验驱动, 增量维护。**
+## 账号封禁与策略迁移
 
-- 主标签: `<|tool▁calls▁begin|>` / `<|tool▁calls▁end|>`
-- 回退列表默认为空, 发现模型输出幻觉变体时再逐个追加到 `extra_starts` / `extra_ends`
-- `<|tool▁calls▁begin|>` 格式模型几乎不产生幻觉, 省去了大量回退维护成本
+固定标签 `<|tool▁calls▁begin|>` 在长期使用后被 DeepSeek 网页版后端识别为机器特征, 触发账号封禁。原因分析:
+
+- 固定标签 + 单个 JSON 数组的格式过于规整, 与人类自然对话差异显著
+- 标签文本本身是 tokenizer 已有 token 模式, 但作为"工具调用容器"出现频率异常
+- 多轮对话中标签重复出现, 形成可被规则匹配的指纹
+
+为此, 将 [deepseek-pp](https://github.com/qoomezhu/deepseek-pp) 项目的注入逻辑移植到本仓库, 替换原有固定标签策略。
+
+## 当前策略: per-tool XML 标签（移植自 deepseek-pp）
+
+每个工具使用独立的 XML 标签, 标签名即工具名, 标签体为 JSON 参数对象:
+
+```
+<get_weather>
+{"city": "Beijing"}
+</get_weather>
+```
+
+### 工具 schema 注入格式
+
+采用对话式自然语言描述, 而非 rigid rules, 避免触发后端的"系统提示词指纹"检测。每个工具的 schema 注入到 System 消息尾部, 格式如下:
+
+```
+## Tools
+
+### Tool get_weather
+Description: 获取指定城市的天气信息
+Valid call format for get_weather:
+<get_weather>
+{"city": "Beijing"}
+</get_weather>
+Parameters JSON Schema: {"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
+
+### Tool calc
+Description: 计算数学表达式
+Valid call format for calc:
+<calc>
+{"expression": "1+1"}
+</calc>
+Parameters JSON Schema: {"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}
+```
+
+### 工具调用历史回放
+
+assistant 消息中的 `tool_calls` 同样以 per-tool XML 标签格式回放, 与模型输出格式保持一致:
+
+```
+<get_weather>
+{"city": "Beijing"}
+</get_weather>
+```
+
+### 解析端实现
+
+`src/openai_adapter/response/tool_parser.rs` 实现流式状态机解析:
+
+- **Normal 状态**: 扫描文本寻找 `<tool_name>` 开标签, 未找到则释放安全部分, 保留可能是部分标签的尾部
+- **Suppressing 状态**: 收集标签体直到 `</tool_name>` 闭标签, 解析 JSON
+- 支持流中顺序多个不同工具的调用
+- 支持部分标签检测（处理 chunk 在标签中间被切分的情况）
+- 保留 JSON 修复逻辑（反斜杠转义、未引用 key 修复）
+- 保留 `<invoke>` legacy 回退
+
+### 工具名来源
+
+- 主列表: 从请求的 `tools` 字段中自动提取 `function.name`
+- 额外列表: 通过 `config.toml` 的 `[ds_core.tool_call]` → `extra_tool_names` 配置
+- 合并后传入 `TagConfig.tool_names`, 用于流式解析时的标签匹配
+
+### 与原策略的对比
+
+| 维度 | 原策略（已废弃） | 新策略（per-tool XML） |
+| --- | --- | --- |
+| 标签格式 | `<\|tool▁calls▁begin\|>[...]<\|tool▁calls▁end\|>` | `<tool_name>{json}</tool_name>` |
+| 标签来源 | 固定字符串 | 从请求 tools 定义派生 |
+| 调用容器 | 单个 JSON 数组 | 每个调用独立标签 |
+| schema 注入 | rigid rules + reminder | 对话式自然语言描述 |
+| 注入位置 | `<think>` 块内 | System 消息尾部 |
+| 封禁风险 | 高（固定指纹） | 低（标签随工具名变化） |
+
+### 配置参考
+
+```toml
+[ds_core.tool_call]
+# 额外可识别的工具名（未在请求 tools 中定义, 但模型可能输出的标签名）
+extra_tool_names = ["custom_tool_a", "custom_tool_b"]
+```
