@@ -264,16 +264,17 @@ All stream wrappers use `pin_project_lite::pin_project!` macro and implement `St
 
 ### Tool Calls via XML
 
-Tool definitions are injected as natural language into the prompt inside a `<think>` block (see `docs/deepseek-prompt-injection.md`). Response `<tool_calls>` XML is parsed back into structured JSON via `ToolCallStream`:
+Tool definitions are injected as natural-language conversational schema into the System message tail (see `docs/deepseek-prompt-injection.md`). Each tool uses an independent XML tag `<tool_name>{json}</tool_name>`, where the tag name is the tool name. Response tags are parsed back into structured JSON via `ToolCallStream`:
 
-1. **Sliding window detector** accumulates content chunks and looks for `<tool_calls>` XML tags
-2. **Fuzzy character normalization**: U+FF5C→|, U+2581→_
-3. **JSON repair**: backslash escaping, unquoted keys
-4. **Fallback tags**: configurable via `TagConfig.extra_starts`/`extra_ends` in `config.toml`
-5. **`<invoke>` XML fallback** for alternative tag formats
-6. `arguments` field normalized to always be a JSON string
+1. **Per-tool XML tag detector** scans content chunks for `<tool_name>` open tags (tag name derived from request tools)
+2. **State machine**: `Normal` (scan for open tag, release safe prefix, retain possible partial-tag tail) → `Suppressing` (collect body until `</tool_name>` close tag, parse JSON)
+3. **Partial tag detection**: handles chunks split mid-tag (`get_partial_xml_tool_tag_tail_length`)
+4. **JSON repair**: backslash escaping, unquoted keys
+5. **Extra tool names**: configurable via `TagConfig.tool_names` (merged from request tools + `extra_tool_names` in `config.toml`)
+6. **`<invoke>` XML fallback** for legacy tag formats
+7. `arguments` field normalized to always be a JSON string
 
-Primary tag: `<tool_calls>` (plural). Configurable fallback tags via `TagConfig` in `config.toml`.
+Primary tag: per-tool XML `<tool_name>` (tag name = tool name). Configurable extra tool names via `TagConfig` in `config.toml`.
 
 ### History Splitting & File Upload
 
@@ -424,7 +425,7 @@ Follow `docs/code-style.md`:
 | WAF blocking (non-US) | AWS WAF Challenge response (status 202) | Configure a non-US proxy in `config.toml` `[proxy]` |
 | WAF blocking (fingerprint) | HTTP 403 or connection reset | `wreq` with BoringSSL automatically emulates Chrome 136 TLS fingerprint. If blocked, try updating `wreq` or switching emulation profile |
 | Account init failure | All accounts stuck in init | Bad credentials (login fails first) or rate-limited (too many sessions). Check `[accounts]` in config |
-| Tool call parse failure | No `tool_calls` in response, raw XML visible | Model output a tag variant not in the parse list. Add fallback `extra_starts`/`extra_ends` in `config.toml` `[ds_core]` |
+| Tool call parse failure | No `tool_calls` in response, raw XML visible | Model output a tool tag whose name is not in the parse list. Add the tool name to `extra_tool_names` in `config.toml` `[ds_core.tool_call]` |
 | Rate limited | Repeated `CoreError::Overloaded` | Add more accounts or reduce concurrency. 6x exponential backoff handles transient spikes |
 | Session errors mid-stream | `invalid message id`, session not found | Usually handled by `GuardedStream::drop` cleanup. If persistent, check concurrent access to same account |
 | Oversized prompt rejected | `413` or truncation errors | Prompt exceeds DeepSeek limit. The oversized prompt fallback (chunked completion + file upload) handles this automatically; check `oversized_prompt` config section |
@@ -446,7 +447,7 @@ Follow `docs/code-style.md`:
 | File upload extraction | `src/openai_adapter/request/files.rs` | data URL → FilePayload, HTTP URL → search mode |
 | Token counting (tiktoken) | `src/openai_adapter.rs` | `OpenAIAdapter::bpe` field, inlined in `chat_completions()` |
 | OpenAI response conversion | `src/openai_adapter/response/` | converter → tool_parser → repair → stop_detect |
-| Tool call parser & stop sequences | `src/openai_adapter/response/tool_parser.rs` | `TagConfig` with extra_starts/extra_ends; stop filtering embedded |
+| Tool call parser & stop sequences | `src/openai_adapter/response/tool_parser.rs` | `TagConfig` with `tool_names` (per-tool XML tags); stop filtering embedded |
 | Stream pipeline config | `src/openai_adapter/response.rs` | `StreamCfg` struct (consolidates 8 stream params) |
 | Anthropic compat layer | `src/anthropic_compat/` | Built on openai_adapter, no direct ds_core access |
 | Anthropic streaming response | `src/anthropic_compat/response/stream.rs` | OpenAI SSE → Anthropic SSE event stream |

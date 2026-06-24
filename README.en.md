@@ -119,13 +119,12 @@ The Anthropic compatibility layer uses the same model IDs via `/anthropic/v1/mes
   {"type": "image", "source": {"type": "url", "url": "https://example.com/img.jpg"}}
   ```
 
-### Tool Call Tag Hallucination
+### Tool Call Tags
 
-Built-in fuzzy matching handles variations (full-width `｜`<=>`|`, `▁`<=>`_`) for most formats. If the model outputs a different fallback tag, add it via the admin panel or in `config.toml` under `[ds_core]`:
+Uses a per-tool XML tag strategy: each tool has its own tag `<tool_name>{json}</tool_name>`, where the tag name is the tool name (auto-extracted from the request's tools definition). If the model outputs tool tags not defined in the request's tools, add them via the admin panel or in `config.toml` under `[ds_core]`:
 
 ```toml
-tool_call.extra_starts = ["<|tool_call_begin|>", "<tool_calls>", "<tool_call>"]
-tool_call.extra_ends = ["<|tool_call_end|>", "</tool_calls>", "</tool_call>"]
+tool_call.extra_tool_names = ["custom_tool_a", "custom_tool_b"]
 ```
 
 ## Web Admin Panel
