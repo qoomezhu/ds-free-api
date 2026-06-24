@@ -1,82 +1,72 @@
 # deepseek-pp 功能融入 ds-free-api 设计文档
 
 > 日期：2026-06-24
-> 状态：待审核
+> 状态：待审核（v2 — 重新定位为 API 代理 + prompt 增强服务）
 > 范围：将 deepseek-pp 浏览器扩展的核心功能复现到 ds-free-api（Rust web2api 代理）中
 
 ## 1. 概述
 
-### 1.1 目标
+### 1.1 定位
 
-将 [deepseek-pp](https://github.com/qoomezhu/deepseek-pp) 浏览器扩展的核心功能融入本项目（ds-free-api），使 web2api 代理具备 AI Agent 工作台能力：长期记忆、Skill、MCP 工具、项目上下文、系统提示词预设、联网搜索、可下载产物、对话导出、自动化任务和保存项。
+本项目作为 **API 接入给其他 agent 调用**，不是 agent 本身。deepseek-pp 的功能按两种方式融入：
+
+1. **提供 agent 可用的接口**：通过 Admin API 管理记忆、Skill、预设、项目、保存项、自动化、产物等数据
+2. **处理转化**：agent 发标准 OpenAI 请求时，服务端自动把激活的预设、相关记忆、项目上下文、Skill 指令注入到发给 DeepSeek 的 prompt 中，agent 无需自己处理复杂的 prompt 增强逻辑
+
+**不做 Agent 循环**：服务端不自动执行任何工具，不检测工具调用 XML 标签，不回传工具结果继续生成。所有工具执行由调用方 agent 自己完成。
 
 ### 1.2 排除范围
 
-- **侧边栏 UI**：deepseek-pp 的浏览器侧边栏对话入口（本项目通过 admin 面板 + API 端点替代）
-- **悬浮宠物**：DeepSeek 页面小鲸鱼（纯浏览器 UI，不适用）
-- **云同步**：WebDAV/Google Drive/OneDrive 同步（用户明确排除）
-- **浏览器控制**：依赖 Chrome Debugger + Accessibility Tree，服务端无法复现
-- **Shell/Python 沙箱**：`shell_exec`/`python_exec`/`sandbox_run` 在服务器执行命令有安全风险，排除
+- **Agent 循环**：服务端不自动执行工具、不循环生成
+- **内置工具执行**：不实现 memory_save/web_search/artifact_create 等服务端工具
+- **Web 工具**：web_search / web_fetch 完全移除（agent 自己的 MCP/工具/skill 已覆盖）
+- **MCP 系统**：agent 自己连接和管理 MCP，本项目不参与 MCP 工具发现/注入/执行
+- **侧边栏 UI**：deepseek-pp 的浏览器侧边栏（本项目通过 admin 面板 + API 替代）
+- **悬浮宠物**：纯浏览器 UI，不适用
+- **云同步**：WebDAV/Google Drive/OneDrive（用户明确排除）
+- **浏览器控制**：依赖 Chrome Debugger，服务端无法复现
+- **Shell/Python 沙箱**：服务端执行命令有安全风险，排除
 - **OfficeCLI 文档工具**：依赖 Shell MCP，排除
 
-### 1.3 核心架构决策
+### 1.3 核心价值
 
-**混合 Agent 模式**：
-- **内置工具**（memory_save、web_search 等）在服务端自动执行，通过 Agent 循环把结果回传并继续生成
-- **用户自定义工具**（请求 `tools` 字段）走标准 OpenAI 流程，返回客户端执行
-- 客户端只看到最终回复（内置工具的 XML 标签从输出中剥离）
+agent 调用方的工作流：
+1. 通过 Admin API 管理记忆/Skill/预设/项目等数据
+2. 发标准 OpenAI chat 请求到 `/v1/chat/completions`
+3. 服务端自动完成 prompt 增强（注入记忆+预设+项目+skill）后转发给 DeepSeek
+4. 服务端返回标准 OpenAI 响应（若模型调用了用户定义的 `tools`，按现有 `<tool_call>` 格式解析返回）
+5. agent 自己执行工具，再次发请求（标准 OpenAI 多轮）
 
 ## 2. 架构设计
 
-### 2.1 Agent 循环（核心）
+### 2.1 请求处理管线（无 Agent 循环）
 
 ```
-客户端请求
-  → normalize → tools(用户工具) → files → prompt(注入记忆+skill+预设+项目+内置工具schema)
-  → resolver → ds_core::try_chat
+客户端请求（标准 OpenAI 格式）
+  → normalize::apply         # 现有：验证、默认参数
+  → tools::extract           # 现有：用户自定义工具（保持 <tool_call> 格式）
+  → files::extract           # 现有：data URL / HTTP URL
+  → augmentation::apply      # 新：注入记忆+skill+预设+项目上下文+i18n 模板
+  → prompt::build            # 现有：ChatML → DeepSeek 原生标签
+  → resolver::resolve        # 现有：模型解析、能力开关
+  → ds_core::try_chat        # 现有：发给 DeepSeek
   → 流式响应
-    → ConverterStream: StreamEvent → OpenAI chunks
-    → BuiltinToolStream: 检测内置工具 XML 标签（<memory_save>、<web_search> 等）
-      → 若检测到：缓冲完整工具调用，从输出流中剥离标签
-      → 执行工具（服务端）
-      → 将工具结果作为新 user 消息追加
-      → 发起新一轮 ds_core::try_chat（带工具结果上下文）
-      → 循环，直到无内置工具调用或达到最大步数
-    → ToolCallStream: 解析用户自定义工具 <tool_call>（标准 OpenAI）
-    → StopDetectStream
+    → ConverterStream        # 现有：StreamEvent → OpenAI chunks
+    → ToolCallStream         # 现有：解析用户自定义 <tool_call>
+    → StopDetectStream       # 现有
   → SSE 输出到客户端
 ```
 
-**关键设计**：
-- 内置工具使用**直接 XML 标签**格式（`<memory_save>{JSON}</memory_save>`），可出现在回复任意位置
-- 用户自定义工具保持现有 `<tool_call>[JSON数组]</tool_call>` 格式
-- Agent 循环最大步数：10（可配置），步间间隔 1s
-- 流式输出：内置工具执行期间向客户端发送 `/* 执行工具中... */` 注释块保持连接
+**与原方案的区别**：移除了 `BuiltinToolStream` 和 Agent 循环。服务端只做 prompt 增强 + 协议转化，不做工具执行。
 
 ### 2.2 工具系统
 
-#### 内置工具（服务端自动执行）
+**仅保留用户自定义工具**（标准 OpenAI 流程）：
+- 请求 `tools` 字段定义的工具 → 注入为 `<tool_call>[JSON数组]</tool_call>` 格式到 prompt
+- 模型输出 `<tool_call>` 标签 → `ToolCallStream` 解析为 OpenAI `tool_calls` 返回客户端
+- 客户端执行工具后，把结果作为新的 `tool` 角色消息发回（标准 OpenAI 多轮）
 
-| 工具名 | 说明 | 执行方式 |
-|--------|------|---------|
-| `memory_save` | 保存长期记忆 | 写入 memories.json |
-| `memory_update` | 更新记忆 | 修改 memories.json |
-| `memory_delete` | 删除记忆 | 修改 memories.json |
-| `web_search` | Bing 搜索 | wreq 抓取 Bing + HTML 解析 |
-| `web_fetch` | 获取网页文本 | wreq 下载 + 文本提取 |
-| `artifact_create` | 创建可下载文件 | 存储到 artifacts 目录 |
-| `artifact_bundle` | 打包多文件 ZIP | 生成 ZIP 存储到 artifacts 目录 |
-| `skill_creator` | 生成 Skill 草稿 | 返回草稿供用户确认 |
-| `memory_import` | 批量导入记忆 | 解析+去重写入 |
-| `task_complete` | 标记任务完成 | 终止 Agent 循环 |
-
-#### 用户自定义工具（返回客户端）
-
-保持现有行为不变：`<tool_call>[{name, arguments}]</tool_call>` → 解析为 OpenAI `tool_calls` 返回客户端。
-
-#### MCP 工具（服务端自动执行）
-
-从已连接的 MCP 服务发现工具，注入为直接 XML 标签格式，服务端调用 MCP 服务执行。
+**不实现任何服务端自动执行的工具**。
 
 ### 2.3 存储设计
 
@@ -92,33 +82,25 @@
 ├── presets.json         # 新：系统提示词预设
 ├── projects.json        # 新：项目上下文
 ├── saved_items.json     # 新：保存项
-├── mcp_servers.json     # 新：MCP 服务配置（也可在 config.toml）
 ├── automations.json     # 新：自动化任务
-└── artifacts/           # 新：生成的产物文件
+├── automation_runs.json # 新：自动化运行历史
+└── artifacts/           # 新：产物文件目录
 ```
 
 每个 JSON 文件由 `StoreManager` 统一管理，原子写入（tmp + rename，0600 权限），与现有 `Config::save()` 模式一致。
 
 ### 2.4 Prompt 增强管线
 
-在现有 `request/prompt.rs` 的 `build()` 之前，新增 `augmentation` 阶段：
+`augmentation::apply` 在 `files::extract` 之后、`prompt::build` 之前执行，向 `ChatCompletionsRequest` 的 system 消息注入增强内容。
 
-```
-ChatCompletionsRequest
-  → normalize::apply         # 现有
-  → tools::extract           # 现有：用户工具
-  → files::extract           # 现有
-  → augmentation::apply      # 新：注入记忆+skill+预设+项目+内置工具schema
-  → prompt::build            # 现有：ChatML → DeepSeek 标签
-  → resolver::resolve        # 现有
-```
+**注入顺序**（拼接到 system 消息尾部）：
+1. 激活预设内容（按 `preset_cadence` 决定是否注入：每条/仅首条/关闭）
+2. 系统提示词模板（i18n，含记忆块占位 + 记忆保存规则说明 + 工具调用格式提醒）
+3. 项目上下文（项目指令 + 项目记忆，若请求关联了项目）
+4. Skill 指令（若用户消息以 `/skillname` 开头）
+5. 强制回复语言（若配置非 auto）
 
-`augmentation::apply` 注入顺序（拼接到 system 消息尾部）：
-1. 激活预设内容（首条消息注入）
-2. 系统提示词模板（含记忆块 + 内置工具 schema + 记忆保存规则 + 搜索规则）
-3. 项目上下文（项目指令 + 项目记忆）
-4. Skill 指令（若检测到 `/skill` 命令）
-5. 强制回复语言（若配置）
+**记忆注入**：通过记忆选择器从 `memories.json` 筛选相关记忆，注入到系统提示词的 `## 已有记忆` 区块。
 
 ## 3. 子系统设计
 
@@ -148,12 +130,12 @@ pub struct Memory {
 - Token 预算：1500（prompt > 3000 token 时递减到最低 800）
 - 格式：`- #id [type] name: content`
 
-**注入**：在系统提示词的 `## 已有记忆` 区块注入筛选后的记忆。
+**注入**：在系统提示词的 `## 已有记忆` 区块注入筛选后的记忆。注入后更新 `access_count` 和 `last_accessed_at`。
 
-**工具**：`memory_save`/`memory_update`/`memory_delete`，服务端执行，修改 `memories.json`。
+**工具**：不提供服务端工具。agent 若想让模型"保存记忆"，由 agent 自己解析模型意图后调用 `POST /admin/api/memories`。
 
 **Admin API**：
-- `GET /admin/api/memories` — 列出（支持 type/tag 筛选）
+- `GET /admin/api/memories` — 列出（支持 type/tag/scope 筛选）
 - `POST /admin/api/memories` — 新增
 - `PUT /admin/api/memories/{id}` — 更新
 - `DELETE /admin/api/memories/{id}` — 删除
@@ -171,13 +153,13 @@ pub struct Skill {
     pub description: String,
     pub instructions: String,      // Markdown 指令
     pub source: SkillSource,       // Builtin | Custom
-    pub memory_enabled: bool,
+    pub memory_enabled: bool,      // 是否在该 skill 上下文中注入记忆
     pub enabled: bool,
 }
 ```
 
 **内置 Skill**（移植自 deepseek-pp，排除 shell/OfficeCLI）：
-- `memory` — 记忆管理：`/memory save|list|update|delete`
+- `memory` — 记忆管理指引（`/memory save|list|update|delete`，提示 agent 调用记忆 API）
 - `ultra-think` — 极致深度思考
 - `frontend-design` — 前端设计
 - `doc-coauthoring` — 文档协作
@@ -186,15 +168,15 @@ pub struct Skill {
 - `algorithmic-art` — 算法艺术
 - `canvas-design` — 视觉设计
 
-**触发机制**：用户消息以 `/skillname args` 开头时，解析 skill 名和参数，将 skill 指令替换/包装用户输入。支持链式调用：`/skill1 /skill2 实际输入`。
+**触发机制**：用户消息以 `/skillname args` 开头时，解析 skill 名和参数，将 skill 指令作为 prompt 前缀注入。支持链式调用：`/skill1 /skill2 实际输入`。
 
-**注入**：skill 指令作为 prompt 前缀，后接 `---` 分隔符和用户实际输入。
+**注入**：skill 指令作为 system 消息的一部分，后接 `---` 分隔符。原用户消息保留在 user 角色中。
 
 **Admin API**：
-- `GET /admin/api/skills` — 列出全部
+- `GET /admin/api/skills` — 列出全部（含内置）
 - `POST /admin/api/skills` — 新增自定义
 - `PUT /admin/api/skills/{name}` — 更新
-- `DELETE /admin/api/skills/{name}` — 删除
+- `DELETE /admin/api/skills/{name}` — 删除（内置不可删）
 - `PUT /admin/api/skills/{name}/enabled` — 启用/停用
 
 ### 3.3 系统提示词预设
@@ -212,77 +194,16 @@ pub struct SystemPromptPreset {
 }
 ```
 
-**注入**：激活的预设内容拼接到 system 消息最前面，后接 `---` 分隔符。注入频率可配置：每条消息 / 仅首条 / 关闭。
+**注入**：激活的预设内容拼接到 system 消息最前面，后接 `---` 分隔符。注入频率由 `preset_cadence` 配置：`every`（每条消息）/ `first`（仅首条，默认）/ `off`（关闭）。
 
 **Admin API**：
 - `GET /admin/api/presets` — 列出
 - `POST /admin/api/presets` — 新增
 - `PUT /admin/api/presets/{id}` — 更新
 - `DELETE /admin/api/presets/{id}` — 删除
-- `PUT /admin/api/presets/{id}/active` — 激活
+- `PUT /admin/api/presets/{id}/active` — 激活（自动取消其他激活）
 
-### 3.4 Web 工具（web_search / web_fetch）
-
-**web_search**：
-- 搜索引擎：Bing（`cn.bing.com` / `www.bing.com` 轮询，无需 API key）
-- 实现：wreq GET 请求，HTML 解析 `<li class="b_algo">` 提取标题/URL/摘要
-- 返回：topK 条结果（默认 5，最大 10），格式化为 Markdown 链接列表
-- 超时：8s/域名，总计 18s
-
-**web_fetch**：
-- 实现：wreq GET 请求，提取可见文本
-- HTML 处理：移除 script/style/nav/footer/header 标签，剥离 HTML 标签，解码实体
-- 截断：最大 50000 字符
-- 超时：15s
-
-**注入**：当 web_search 工具启用时，在系统提示词中注入 `## 网络搜索规则` 区块。
-
-**配置**：`[tools]` 区块控制启用/停用。
-
-### 3.5 MCP 系统
-
-**数据结构**：
-```rust
-#[derive(Serialize, Deserialize, Clone)]
-pub struct McpServerConfig {
-    pub id: String,
-    pub name: String,
-    pub transport: McpTransport,   // Sse | Http
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub enabled: bool,
-    pub auto_execute: bool,        // true=服务端自动执行并回传结果；false=作为用户工具返回客户端（标准 OpenAI tool_calls 流程）
-    pub timeouts: McpTimeouts,     // 连接/请求/发现超时
-    pub result_bytes_limit: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct McpTool {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-}
-```
-
-**传输协议**：仅支持 SSE 和 Streamable HTTP（服务端无浏览器 Native Host，不支持 stdio）。
-
-**工具发现**：连接 MCP 服务，调用 `tools/list`，缓存工具列表。
-
-**注入**：启用的 MCP 服务的工具作为直接 XML 标签注入系统提示词的 Available Tools 区块。
-
-**执行**：Agent 循环中检测到 MCP 工具标签时，通过 MCP 协议调用 `tools/call`，结果回传。
-
-**Admin API**：
-- `GET /admin/api/mcp/servers` — 列出
-- `POST /admin/api/mcp/servers` — 新增
-- `PUT /admin/api/mcp/servers/{id}` — 更新
-- `DELETE /admin/api/mcp/servers/{id}` — 删除
-- `POST /admin/api/mcp/servers/{id}/test` — 测试连接
-- `POST /admin/api/mcp/servers/{id}/refresh` — 刷新工具列表
-- `GET /admin/api/mcp/servers/{id}/tools` — 获取发现工具
-- `GET /admin/api/mcp/servers/{id}/history` — 调用历史
-
-### 3.6 项目系统
+### 3.4 项目系统
 
 **数据结构**：
 ```rust
@@ -291,8 +212,8 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub instructions: String,
-    pub memories: Vec<Memory>,     // 项目专属记忆
+    pub instructions: String,      // 项目专属指令
+    pub memories: Vec<Memory>,     // 项目专属记忆（独立于全局记忆）
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -303,19 +224,19 @@ pub struct Project {
 2. 请求体扩展字段 `project_id`（回退）
 3. 均未提供时不关联项目
 
-**注入**：项目指令 + 项目记忆注入到系统提示词的 `## 项目上下文` 区块。
+**注入**：项目指令 + 项目记忆注入到系统提示词的 `## 项目上下文` 区块。项目记忆使用与全局记忆相同的选择器算法，但仅在该项目记忆范围内筛选。
 
 **Admin API**：
 - `GET /admin/api/projects` — 列出
 - `POST /admin/api/projects` — 新增
 - `PUT /admin/api/projects/{id}` — 更新
 - `DELETE /admin/api/projects/{id}` — 删除
-- `GET /admin/api/projects/{id}/memories` — 项目记忆
+- `GET /admin/api/projects/{id}/memories` — 项目记忆列表
 - `POST /admin/api/projects/{id}/memories` — 新增项目记忆
 - `PUT /admin/api/projects/{id}/memories/{mid}` — 更新
 - `DELETE /admin/api/projects/{id}/memories/{mid}` — 删除
 
-### 3.7 保存项
+### 3.5 保存项
 
 **数据结构**：
 ```rust
@@ -339,7 +260,7 @@ pub struct SavedItem {
 - `DELETE /admin/api/saved-items/{id}` — 删除
 - `GET /admin/api/saved-items/export` — 导出 Markdown/JSON
 
-### 3.8 自动化任务
+### 3.6 自动化任务
 
 **数据结构**：
 ```rust
@@ -347,23 +268,34 @@ pub struct SavedItem {
 pub struct AutomationTask {
     pub id: String,
     pub name: String,
-    pub prompt: String,
-    pub model: String,             // 使用的模型
+    pub prompt: String,             // 触发时发送的 prompt
+    pub model: String,              // 使用的模型
     pub trigger: AutomationTrigger, // Manual | Cron(String)
     pub timezone: String,
     pub search_enabled: bool,
     pub thinking_enabled: bool,
     pub enabled: bool,
     pub last_run_at: Option<i64>,
-    pub last_status: Option<AutomationStatus>,
+    pub last_status: Option<AutomationStatus>, // Success | Failed | Running
     pub next_run_at: Option<i64>,
     pub created_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AutomationRun {
+    pub id: String,
+    pub task_id: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub status: AutomationStatus,
+    pub response: Option<String>,   // 模型回复（截断存储，最大 50KB）
+    pub error: Option<String>,
 }
 ```
 
 **调度**：后台 tokio 任务，使用 `tokio-cron-scheduler` crate。最小间隔 15 分钟。
 
-**执行**：触发时创建独立 chat completion 请求（通过内部 `OpenAIAdapter::try_chat`），复用 Agent 循环链路。结果记录到任务历史。
+**执行**：触发时创建独立 chat completion 请求（通过内部 `OpenAIAdapter::try_chat`），**不做 Agent 循环**——单轮请求，结果存入 `automation_runs.json`。若模型返回 `tool_calls`，记录为"需要工具执行"状态，不自动处理。
 
 **Admin API**：
 - `GET /admin/api/automations` — 列出
@@ -373,41 +305,53 @@ pub struct AutomationTask {
 - `POST /admin/api/automations/{id}/run` — 立即运行
 - `PUT /admin/api/automations/{id}/pause` — 暂停
 - `PUT /admin/api/automations/{id}/resume` — 恢复
-- `GET /admin/api/automations/{id}/history` — 运行历史
+- `GET /admin/api/automations/{id}/history` — 运行历史（分页）
 
-### 3.9 对话导出
+### 3.7 对话导出
 
 **实现**：新增导出端点，将 chat completion 请求历史导出为 HTML/Markdown/JSON。
 
 **Admin API**：
-- `POST /admin/api/export/conversation` — 导出指定对话（传入 messages 数组，返回文件）
-  - 参数：`format` (html|markdown|json), `messages`, `readable` (bool)
-- `GET /admin/api/export/saved-items` — 导出保存项
+- `POST /admin/api/export/conversation` — 导出指定对话
+  - 请求体：`{ format: "html"|"markdown"|"json", messages: [...], readable: bool }`
+  - 返回：文件流（Content-Disposition: attachment）
+- `GET /admin/api/export/saved-items` — 导出保存项（Markdown/JSON）
 
-### 3.10 可下载产物
+### 3.8 可下载产物
 
-**工具**：`artifact_create`（单文件）、`artifact_bundle`（ZIP 多文件）
+**定位**：纯存储服务。agent 调用模型生成内容后，agent 自己通过 API 上传存储，获取下载链接。
 
-**实现**：
-- `artifact_create`：将文件内容写入 `{DS_DATA_DIR}/artifacts/{id}`，记录元数据
-- `artifact_bundle`：用 `zip` crate 打包多文件
+**数据结构**：
+```rust
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Artifact {
+    pub id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: u64,
+    pub created_at: i64,
+    pub metadata: Option<serde_json::Value>, // agent 自定义元数据
+}
+```
 
-**获取**：
-- `GET /admin/api/artifacts` — 列出
+**存储**：文件写入 `{DS_DATA_DIR}/artifacts/{id}`，元数据存入 `artifacts/index.json`。
+
+**Admin API**：
+- `GET /admin/api/artifacts` — 列出（分页，支持 filename 搜索）
+- `POST /admin/api/artifacts` — 上传新产物（multipart/form-data 或 JSON base64）
 - `GET /admin/api/artifacts/{id}` — 下载文件
+- `GET /admin/api/artifacts/{id}/meta` — 获取元数据
 - `DELETE /admin/api/artifacts/{id}` — 删除
 
-**注入**：artifact 工具作为内置工具注入系统提示词。
-
-### 3.11 i18n 提示词
+### 3.9 i18n 提示词
 
 **实现**：系统提示词模板支持中文/英文，通过 `[deepseek_pp] locale` 配置。
 
-**模板**：移植自 deepseek-pp `i18n/resources/zh-CN.ts` 和 `en.ts` 的 `prompt.systemChat`、`prompt.systemThinking`、`prompt.webSearchGuidance`、`prompt.toolFormatReminder` 等字段。
+**模板**：移植自 deepseek-pp `i18n/resources/zh-CN.ts` 和 `en.ts` 的 `prompt.systemChat`、`prompt.systemThinking`、`prompt.toolFormatReminder` 等字段。移除 `prompt.webSearchGuidance`（web 工具已删除）。
 
 **默认**：中文（与现有项目一致）。
 
-### 3.12 提示词控制
+### 3.10 提示词控制
 
 **配置**（`[deepseek_pp]` 区块）：
 ```toml
@@ -416,17 +360,8 @@ enabled = true
 locale = "zh"                    # zh | en
 memory_enabled = true
 system_prompt_enabled = true
-preset_cadence = "first"         # default | first | every | off
+preset_cadence = "first"         # every | first | off
 force_response_language = "auto" # auto | zh | en
-max_agent_steps = 10
-agent_step_interval_ms = 1000
-
-[deepseek_pp.tools]
-web_search = true
-web_fetch = true
-artifact = true
-skill_creator = true
-memory_import = true
 ```
 
 ## 4. 配置变更
@@ -441,34 +376,27 @@ memory_enabled = true
 system_prompt_enabled = true
 preset_cadence = "first"
 force_response_language = "auto"
-max_agent_steps = 10
-agent_step_interval_ms = 1000
-
-[deepseek_pp.tools]
-web_search = true
-web_fetch = true
-artifact = true
-skill_creator = true
-memory_import = true
-
-[[deepseek_pp.mcp_servers]]
-id = "example"
-name = "示例 MCP"
-transport = "sse"
-url = "http://localhost:3001/sse"
-enabled = false
-auto_execute = true
 ```
 
 ### 4.2 config.example.toml 更新
 
 在 `config.example.toml` 中添加 `[deepseek_pp]` 完整示例和注释。
 
+### 4.3 请求扩展字段
+
+标准 OpenAI 请求支持以下扩展字段（非破坏性，标准客户端会忽略）：
+- `project_id: String` — 关联项目
+- `insert_saved_items: Vec<String>` — 插入保存项 ID 列表
+
+请求头扩展：
+- `x-ds-project: {project_id}` — 关联项目（优先于请求体字段）
+
 ## 5. Admin API 端点汇总
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
 | GET | `/admin/api/deepseek-pp/status` | 功能总览状态 |
+| GET/PUT | `/admin/api/deepseek-pp/settings` | 提示词控制设置 |
 | GET/POST | `/admin/api/memories` | 记忆列表/新增 |
 | PUT/DELETE | `/admin/api/memories/{id}` | 更新/删除记忆 |
 | PUT | `/admin/api/memories/{id}/pin` | 置顶记忆 |
@@ -487,21 +415,17 @@ auto_execute = true
 | GET/POST | `/admin/api/saved-items` | 保存项列表/新增 |
 | PUT/DELETE | `/admin/api/saved-items/{id}` | 更新/删除 |
 | GET | `/admin/api/saved-items/export` | 导出 |
-| GET/POST | `/admin/api/mcp/servers` | MCP 列表/新增 |
-| PUT/DELETE | `/admin/api/mcp/servers/{id}` | 更新/删除 |
-| POST | `/admin/api/mcp/servers/{id}/test` | 测试连接 |
-| POST | `/admin/api/mcp/servers/{id}/refresh` | 刷新工具 |
-| GET | `/admin/api/mcp/servers/{id}/tools` | 工具列表 |
 | GET/POST | `/admin/api/automations` | 自动化列表/新增 |
 | PUT/DELETE | `/admin/api/automations/{id}` | 更新/删除 |
 | POST | `/admin/api/automations/{id}/run` | 立即运行 |
 | PUT | `/admin/api/automations/{id}/pause` | 暂停 |
 | PUT | `/admin/api/automations/{id}/resume` | 恢复 |
 | GET | `/admin/api/automations/{id}/history` | 运行历史 |
-| GET | `/admin/api/artifacts` | 产物列表 |
+| GET/POST | `/admin/api/artifacts` | 产物列表/上传 |
 | GET/DELETE | `/admin/api/artifacts/{id}` | 下载/删除 |
+| GET | `/admin/api/artifacts/{id}/meta` | 元数据 |
 | POST | `/admin/api/export/conversation` | 导出对话 |
-| GET/PUT | `/admin/api/deepseek-pp/settings` | 提示词控制设置 |
+| GET | `/admin/api/export/saved-items` | 导出保存项 |
 
 ## 6. 前端页面
 
@@ -512,11 +436,10 @@ auto_execute = true
 | MemoryPage | `/memory` | 记忆管理（列表/筛选/编辑/置顶/导入导出） |
 | SkillPage | `/skills` | Skill 管理（内置/自定义/启用控制） |
 | PresetPage | `/presets` | 系统提示词预设管理 |
-| ProjectPage | `/projects` | 项目管理（指令/记忆） |
+| ProjectPage | `/projects` | 项目管理（指令/项目记忆） |
 | SavedPage | `/saved` | 保存项管理（搜索/标签/导出） |
-| McpPage | `/mcp` | MCP 服务管理（连接/测试/工具） |
 | AutomationPage | `/automations` | 自动化任务管理（创建/调度/历史） |
-| ArtifactPage | `/artifacts` | 产物列表/下载 |
+| ArtifactPage | `/artifacts` | 产物列表/上传/下载 |
 | PromptSettingsPage | `/settings/prompt` | 提示词控制（记忆/预设/语言开关） |
 
 Layout 导航更新：在现有侧边栏添加「Agent 工作台」分组。
@@ -527,9 +450,7 @@ Layout 导航更新：在现有侧边栏添加「Agent 工作台」分组。
 src/
 ├── deepseek_pp/              # 新：deepseek-pp 功能模块
 │   ├── mod.rs                # facade: re-exports
-│   ├── augmentation.rs       # prompt 增强（记忆+skill+预设+项目+工具注入），由 openai_adapter/request/prompt.rs 调用
-│   ├── agent_loop.rs         # Agent 循环（工具执行+结果回传+继续生成）
-│   ├── builtin_tools.rs      # 内置工具注册表和执行器
+│   ├── augmentation.rs       # prompt 增强（记忆+skill+预设+项目+i18n 注入）
 │   ├── i18n.rs               # 系统提示词模板（中英文）
 │   ├── memory/
 │   │   ├── mod.rs            # facade
@@ -546,92 +467,74 @@ src/
 │   │   └── store.rs          # 项目存储
 │   ├── saved_items/
 │   │   └── store.rs          # 保存项存储
-│   ├── mcp/
-│   │   ├── mod.rs            # facade
-│   │   ├── client.rs         # MCP 客户端（SSE/HTTP）
-│   │   ├── store.rs          # MCP 服务配置存储
-│   │   └── executor.rs       # MCP 工具执行
-│   ├── web_tools/
-│   │   ├── search.rs         # Bing 搜索
-│   │   └── fetch.rs          # 网页抓取
 │   ├── artifact/
-│   │   └── store.rs          # 产物存储
+│   │   └── store.rs          # 产物存储（文件+元数据）
 │   └── automation/
 │       ├── mod.rs            # facade
 │       ├── scheduler.rs      # cron 调度器
-│       └── runner.rs         # 任务执行器
+│       └── runner.rs         # 任务执行器（单轮 try_chat，不循环）
 ├── openai_adapter/
-│   ├── request/
-│   │   └── augmentation.rs   # 新管线阶段：调用 deepseek_pp::augmentation::apply()
-│   └── response/
-│       └── builtin_tool_stream.rs  # 内置工具 XML 检测流（调用 deepseek_pp::agent_loop）
+│   └── request/
+│       └── augmentation.rs   # 新管线阶段：调用 deepseek_pp::augmentation::apply()
 ├── server/
 │   ├── admin.rs              # 扩展：新增所有 admin API 端点
 │   └── store.rs              # 扩展：新增 JSON 存储管理
 └── config.rs                 # 扩展：DeepSeekPpConfig 结构
 ```
 
-**调用关系**：`augmentation` 作为 `openai_adapter/request/` 管线中的新阶段（位于 `files` 和 `prompt` 之间），调用 `deepseek_pp::augmentation::apply()` 注入增强内容到 `ChatCompletionsRequest`；`openai_adapter/response/builtin_tool_stream.rs` 检测到内置工具标签后调用 `deepseek_pp::agent_loop::execute_tool()` 并触发新一轮生成。
+**调用关系**：
+- `augmentation` 作为 `openai_adapter/request/` 管线中的新阶段（位于 `files` 和 `prompt` 之间），调用 `deepseek_pp::augmentation::apply()` 注入增强内容到 `ChatCompletionsRequest`
+- 响应管线**不变**：仍为 `ConverterStream → ToolCallStream → StopDetectStream`，无 `BuiltinToolStream`
 
 ## 8. 实施阶段
 
-虽然本 spec 覆盖所有子系统，实施按以下顺序分阶段进行，每阶段可独立验收：
+按以下顺序分阶段实施，每阶段可独立验收：
 
-### 阶段 1：Agent 循环框架 + 记忆系统
-- `deepseek_pp/` 模块骨架
-- 内置工具注册表和执行框架
-- `BuiltinToolStream`（响应流中检测 XML 标签）
-- Agent 循环（工具执行 → 结果回传 → 继续生成）
-- 记忆存储 + 选择器 + 注入 + memory_save/update/delete 工具
-- 系统提示词模板（i18n）
-- Admin API：记忆 CRUD
-- 前端：MemoryPage
+### 阶段 1：Prompt 增强框架 + 记忆系统
+- `deepseek_pp/` 模块骨架（mod.rs, augmentation.rs, i18n.rs）
+- `openai_adapter/request/augmentation.rs` 管线阶段接入
+- 记忆存储 + 选择器 + 注入逻辑
+- 系统提示词模板（i18n 中英文）
+- Admin API：记忆 CRUD + 导入导出
+- 前端：MemoryPage + PromptSettingsPage
 
 ### 阶段 2：Skill + 预设系统
 - Skill 注册表 + 解析器 + 内置 skill
-- 预设存储 + 注入
-- Admin API + 前端页面
+- 预设存储 + 注入（按 cadence）
+- Admin API + 前端：SkillPage + PresetPage
 
-### 阶段 3：Web 工具
-- web_search（Bing 搜索）
-- web_fetch（网页抓取）
-- Admin API：工具开关
-- 前端：工具设置
+### 阶段 3：项目 + 保存项
+- 项目存储 + 上下文注入 + 项目记忆
+- 保存项存储 + 请求时插入
+- 请求扩展字段解析（project_id / insert_saved_items / x-ds-project header）
+- Admin API + 前端：ProjectPage + SavedPage
 
-### 阶段 4：MCP 系统
-- MCP 客户端（SSE/HTTP）
-- 工具发现 + 注入 + 执行
-- Admin API + 前端：McpPage
-
-### 阶段 5：项目 + 保存项
-- 项目存储 + 上下文注入
-- 保存项存储
-- Admin API + 前端页面
-
-### 阶段 6：自动化 + 导出 + 产物
-- 自动化调度器 + 任务执行器
+### 阶段 4：自动化 + 导出 + 产物
+- 自动化调度器 + 任务执行器（单轮）
 - 对话导出端点
-- artifact 工具 + 存储
-- Admin API + 前端页面
+- 产物存储 + 上传/下载
+- Admin API + 前端：AutomationPage + ArtifactPage
 
 ## 9. 依赖新增
 
-| Crate | 用途 |
-|-------|------|
-| `zip` | artifact_bundle 打包 |
-| `tokio-cron-scheduler` | 自动化任务调度 |
-| `scraper` | Bing 搜索结果 HTML 解析（或用正则） |
-| `jieba-rs` | 中文分词（记忆选择器，可选） |
+| Crate | 用途 | 必要性 |
+|-------|------|--------|
+| `tokio-cron-scheduler` | 自动化任务 cron 调度 | 必需 |
+| `jieba-rs` | 中文分词（记忆选择器） | 可选（默认用简单字符分割） |
 
-`wreq` 已用于 HTTP 客户端，web_search/web_fetch 复用。
+**移除的依赖**（相比 v1 方案）：
+- `zip` — 产物改为单文件上传，不需要打包
+- `scraper` — web_search 已移除
+
+`wreq` 已用于 HTTP 客户端，自动化任务执行复用。
 
 ## 10. 风险与缓解
 
 | 风险 | 缓解 |
 |------|------|
-| Agent 循环增加延迟 | 最大步数限制 + 步间间隔；流式输出保持连接 |
-| 内置工具 XML 误解析 | 严格标签名匹配（仅注册的工具名）；滑动窗口检测 |
-| 记忆无限增长 | Token 预算限制注入量；定期清理提示 |
-| MCP 服务不可用 | 超时 + 降级（跳过不可用工具） |
-| 自动化任务并发冲突 | 每任务独立会话；调度器互斥锁 |
-| Bing 搜索被封锁 | 多域名轮询 + User-Agent 伪装；可配置代理 |
+| 记忆无限增长 | Token 预算限制注入量；admin 面板提供清理工具 |
+| Prompt 增强增加 token 消耗 | 记忆预算 1500 上限；预设 cadence 可配置为 `off` |
+| 自动化任务并发冲突 | 每任务独立会话；调度器互斥锁；最小间隔 15 分钟 |
+| 自动化模型返回 tool_calls | 记录为"需要工具执行"状态，不自动处理（符合无 Agent 循环定位） |
+| 产物存储磁盘溢出 | 上传大小限制（默认 10MB）；admin 面板提供批量删除 |
+| 请求扩展字段被标准客户端拒绝 | 字段为可选，标准 OpenAI 客户端会忽略未知字段；header 方式更通用 |
