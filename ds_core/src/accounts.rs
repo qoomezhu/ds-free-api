@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::CoreError;
-use crate::config::{AccountConfig, DsCoreConfig};
+use crate::config::{AccountConfig, BehaviorConfig, DsCoreConfig};
 pub use client::{ClientError, CompletionPayload, DsClient, StopStreamPayload};
 pub use pool::{AccountGuard, AccountPool, AccountStatus, PoolError};
 pub use pow::{PowError, PowSolver};
@@ -23,6 +23,8 @@ pub struct Accounts {
     pool: Arc<AccountPool>,
     client: RwLock<DsClient>,
     solver: RwLock<PowSolver>,
+    /// 行为伪装配置（PoW 延迟等），热更新时通过 reload_config 刷新
+    behavior: RwLock<BehaviorConfig>,
 }
 
 impl Accounts {
@@ -71,6 +73,7 @@ impl Accounts {
             pool,
             client: RwLock::new(client),
             solver: RwLock::new(solver),
+            behavior: RwLock::new(config.behavior.clone()),
         }))
     }
 
@@ -204,6 +207,9 @@ impl Accounts {
     }
 
     /// 计算指定 target_path 的 PoW header
+    ///
+    /// 算完后按 `behavior.pow_delay_ms` 随机延迟，模拟真实浏览器 JS 计算 PoW 的耗时，
+    /// 避免被 PoW 时延异常标记为反代。
     pub async fn compute_pow_for_target(
         &self,
         token: &str,
@@ -224,6 +230,20 @@ impl Accounts {
                 log::warn!(target: "ds_core::accounts", "PoW computation failed: {}", e);
                 CoreError::ProofOfWorkFailed(e)
             })?;
+        // PoW 计算后延迟发送，模拟浏览器 JS 执行耗时
+        let (min, max) = self.behavior.read().await.pow_delay_ms;
+        if max > 0 {
+            let bound = (max - min).max(1);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::from(d.subsec_nanos()))
+                .unwrap_or(0);
+            let extra = (nanos % bound).min(bound - 1);
+            let delay = min + extra;
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
         Ok(result.to_header())
     }
 
@@ -271,6 +291,7 @@ impl Accounts {
         self.pool
             .set_daily_request_limit(config.behavior.daily_request_limit)
             .await;
+        *self.behavior.write().await = config.behavior.clone();
         *self.client.write().await = client;
         *self.solver.write().await = solver;
         Ok(())

@@ -30,16 +30,22 @@ pub type ChunkStream =
 
 /// 将根 crate 的 `BehaviorSection` 转换为 `ds_core::BehaviorConfig`
 ///
-/// 校验 jitter 范围合法性：min > max 时交换；两者皆为 0 表示禁用抖动
+/// 校验范围合法性：min > max 时交换；两者皆为 0 表示禁用
 fn behavior_cfg_from(s: &crate::config::BehaviorSection) -> BehaviorConfig {
-    let mut min = s.request_jitter_ms[0];
-    let mut max = s.request_jitter_ms[1];
-    if min > max {
-        std::mem::swap(&mut min, &mut max);
+    let mut jmin = s.request_jitter_ms[0];
+    let mut jmax = s.request_jitter_ms[1];
+    if jmin > jmax {
+        std::mem::swap(&mut jmin, &mut jmax);
+    }
+    let mut pmin = s.pow_delay_ms[0];
+    let mut pmax = s.pow_delay_ms[1];
+    if pmin > pmax {
+        std::mem::swap(&mut pmin, &mut pmax);
     }
     BehaviorConfig {
-        request_jitter_ms: (min, max),
+        request_jitter_ms: (jmin, jmax),
         daily_request_limit: s.daily_request_limit,
+        pow_delay_ms: (pmin, pmax),
     }
 }
 

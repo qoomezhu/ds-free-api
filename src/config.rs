@@ -86,6 +86,12 @@ pub struct BehaviorSection {
     /// 设为 0 表示不限制。
     #[serde(default = "default_daily_request_limit")]
     pub daily_request_limit: u32,
+    /// PoW 计算后随机延迟范围（毫秒）：[min, max]
+    ///
+    /// 反代用 wasmtime 秒算 PoW，真实浏览器需要 200-800ms。算完后延迟发送
+    /// 可避免被 PoW 时延异常标记。设为 [0, 0] 禁用。
+    #[serde(default = "default_pow_delay_ms")]
+    pub pow_delay_ms: [u64; 2],
 }
 
 impl Default for BehaviorSection {
@@ -93,6 +99,7 @@ impl Default for BehaviorSection {
         Self {
             request_jitter_ms: default_request_jitter_ms(),
             daily_request_limit: default_daily_request_limit(),
+            pow_delay_ms: default_pow_delay_ms(),
         }
     }
 }
@@ -103,6 +110,10 @@ fn default_request_jitter_ms() -> [u64; 2] {
 
 fn default_daily_request_limit() -> u32 {
     80
+}
+
+fn default_pow_delay_ms() -> [u64; 2] {
+    [200, 800]
 }
 
 impl DsCoreSection {

@@ -15,6 +15,12 @@ pub struct BehaviorConfig {
     /// 真实用户每日对话量有限，单账号高频调用会触发 DeepSeek 黄色熔断
     /// （单账号 GPU 耗时突增 300%）。建议 50-100。
     pub daily_request_limit: u32,
+    /// PoW 计算后随机延迟范围（毫秒）：[min, max]
+    ///
+    /// 反代用 wasmtime 秒算 PoW，真实浏览器需要 200-800ms。算完后延迟发送
+    /// 可避免被 PoW 时延异常标记。设为 [0, 0] 禁用。
+    /// 默认 [200, 800]：浏览器 JS 计算 DeepSeekHashV1 的常见耗时区间。
+    pub pow_delay_ms: (u64, u64),
 }
 
 impl Default for BehaviorConfig {
@@ -22,6 +28,7 @@ impl Default for BehaviorConfig {
         Self {
             request_jitter_ms: (500, 3000),
             daily_request_limit: 80,
+            pow_delay_ms: (200, 800),
         }
     }
 }
