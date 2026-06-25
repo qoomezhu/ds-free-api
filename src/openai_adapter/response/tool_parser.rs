@@ -286,53 +286,58 @@ pub(crate) fn contains_start_tag_with(s: &str, cfg: &TagConfig) -> bool {
 /// 扫描所有 `<tool_name>{json}</tool_name>` 模式，返回工具调用列表和
 /// 移除工具标签后的剩余文本。同时支持 `<invoke name="...">` legacy 格式。
 pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall>, String)> {
-    if cfg.tool_names.is_empty() {
-        return None;
-    }
-
+    // tool_names 为空时仍尝试 legacy <invoke> 回退（模型可能输出客户端注入的格式）
     let mut calls = Vec::new();
     let mut remaining = String::with_capacity(xml.len());
     let mut cursor = 0;
 
-    loop {
-        let open_tag = find_first_xml_tool_tag(xml, &cfg.tool_names, false, cursor);
-        let Some(open) = open_tag else {
-            remaining.push_str(&xml[cursor..]);
-            break;
-        };
+    if cfg.tool_names.is_empty() {
+        remaining.push_str(xml);
+    } else {
+        loop {
+            let open_tag = find_first_xml_tool_tag(xml, &cfg.tool_names, false, cursor);
+            let Some(open) = open_tag else {
+                remaining.push_str(&xml[cursor..]);
+                break;
+            };
 
-        // 代码块内的标签跳过
-        if is_inside_code_fence(xml, open.index) {
-            remaining.push_str(&xml[cursor..open.end_index]);
-            cursor = open.end_index;
-            continue;
-        }
+            // 代码块内的标签跳过
+            if is_inside_code_fence(xml, open.index) {
+                remaining.push_str(&xml[cursor..open.end_index]);
+                cursor = open.end_index;
+                continue;
+            }
 
-        // 添加开标签之前的文本
-        remaining.push_str(&xml[cursor..open.index]);
+            // 添加开标签之前的文本
+            remaining.push_str(&xml[cursor..open.index]);
 
-        // 查找匹配的闭标签
-        let close_tag =
-            find_first_xml_tool_tag(xml, std::slice::from_ref(&open.name), true, open.end_index);
-        let Some(close) = close_tag else {
-            // 没有闭标签，尝试解析到文本末尾
-            let body = &xml[open.end_index..];
+            // 查找匹配的闭标签
+            let close_tag = find_first_xml_tool_tag(
+                xml,
+                std::slice::from_ref(&open.name),
+                true,
+                open.end_index,
+            );
+            let Some(close) = close_tag else {
+                // 没有闭标签，尝试解析到文本末尾
+                let body = &xml[open.end_index..];
+                if let Some(mut call) = parse_tool_call_body(&open.name, body) {
+                    call.index = calls.len() as u32;
+                    calls.push(call);
+                }
+                break;
+            };
+
+            let body = &xml[open.end_index..close.index];
             if let Some(mut call) = parse_tool_call_body(&open.name, body) {
                 call.index = calls.len() as u32;
                 calls.push(call);
             }
-            break;
-        };
-
-        let body = &xml[open.end_index..close.index];
-        if let Some(mut call) = parse_tool_call_body(&open.name, body) {
-            call.index = calls.len() as u32;
-            calls.push(call);
+            cursor = close.end_index;
         }
-        cursor = close.end_index;
     }
 
-    // 也尝试 legacy <invoke> 格式
+    // 也尝试 legacy <invoke> 格式（含 <tool_calls> 包装）
     if calls.is_empty() {
         if let Some((invoke_calls, invoke_remaining)) = parse_invoke_calls(xml) {
             return Some((invoke_calls, invoke_remaining));
@@ -573,6 +578,42 @@ fn make_end_chunk(
 
 // ── 流式工具调用解析器 ───────────────────────────────────────────────────
 
+/// 触发模式：决定如何查找闭标签与解析标签体
+#[derive(Debug, Clone)]
+enum TriggerKind {
+    /// Per-tool XML: `<name>{json}</name>`，标签名即工具名
+    XmlTag { name: String },
+    /// `<invoke name="...">...</invoke>`（含 `<parameter>` 子元素）
+    Invoke,
+    /// `<tool_calls>...</tool_calls>`（内含一个或多个 `<invoke>`）
+    ToolCalls,
+    /// `<tool_call>...</tool_call>`（单数变体）
+    ToolCall,
+}
+
+impl TriggerKind {
+    /// 解析标签体并返回工具调用列表
+    ///
+    /// - `XmlTag`: 将 body 视为 JSON，调用 `parse_tool_call_body`
+    /// - `Invoke`/`ToolCalls`/`ToolCall`: 将完整文本（open_tag + body + close_tag）
+    ///   交给 `parse_invoke_calls`，其内部会扫描 `<invoke>` 标签
+    fn parse(&self, open_tag: &str, body: &str, close_tag: &str) -> Option<Vec<ToolCall>> {
+        match self {
+            TriggerKind::XmlTag { name } => parse_tool_call_body(name, body).map(|c| vec![c]),
+            TriggerKind::Invoke | TriggerKind::ToolCalls | TriggerKind::ToolCall => {
+                // ToolCalls 的 body 内已包含 <invoke> 标签；
+                // Invoke 需要重建完整 <invoke>...</invoke> 文本
+                let full = if matches!(self, TriggerKind::ToolCalls) {
+                    body.to_string()
+                } else {
+                    format!("{open_tag}{body}{close_tag}")
+                };
+                parse_invoke_calls(&full).map(|(calls, _)| calls)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ToolParseState {
     /// 正常状态：扫描文本寻找开标签
@@ -580,9 +621,111 @@ enum ToolParseState {
     /// 抑制状态：收集标签体直到闭标签
     Suppressing {
         body: String,
-        tool_name: String,
+        close_tag: String,
         open_tag: String,
+        kind: TriggerKind,
     },
+}
+
+/// 流式触发匹配结果
+struct TriggerMatch {
+    /// '<' 的字节位置
+    index: usize,
+    /// 开标签 '>' 之后的位置
+    end_index: usize,
+    /// 完整开标签文本
+    open_tag: String,
+    /// 对应闭标签字符串
+    close_tag: String,
+    /// 触发模式
+    kind: TriggerKind,
+}
+
+/// 在 text 中查找最早的工具调用触发标签（per-tool XML / `<invoke` / `<tool_calls>` / `<tool_call>`）
+fn find_first_trigger(text: &str, tool_names: &[String]) -> Option<TriggerMatch> {
+    let mut best: Option<TriggerMatch> = None;
+
+    // 1. Per-tool XML 开标签
+    if !tool_names.is_empty()
+        && let Some(m) = find_first_xml_tool_tag(text, tool_names, false, 0)
+    {
+        best = Some(TriggerMatch {
+            index: m.index,
+            end_index: m.end_index,
+            open_tag: m.raw.clone(),
+            close_tag: format!("</{}>", m.name),
+            kind: TriggerKind::XmlTag { name: m.name },
+        });
+    }
+
+    // 2. <tool_calls> 包装标签
+    if let Some(pos) = text.find("<tool_calls>")
+        && best.as_ref().is_none_or(|b| pos < b.index)
+    {
+        best = Some(TriggerMatch {
+            index: pos,
+            end_index: pos + "<tool_calls>".len(),
+            open_tag: "<tool_calls>".to_string(),
+            close_tag: "</tool_calls>".to_string(),
+            kind: TriggerKind::ToolCalls,
+        });
+    }
+
+    // 3. <tool_call> 单数变体（避免与 <tool_calls> 混淆，需精确匹配 '>'）
+    if let Some(pos) = text.find("<tool_call>")
+        && best.as_ref().is_none_or(|b| pos < b.index)
+    {
+        best = Some(TriggerMatch {
+            index: pos,
+            end_index: pos + "<tool_call>".len(),
+            open_tag: "<tool_call>".to_string(),
+            close_tag: "</tool_call>".to_string(),
+            kind: TriggerKind::ToolCall,
+        });
+    }
+
+    // 4. <invoke name="..."> 标签
+    if let Some(pos) = text.find("<invoke ")
+        && let Some(gt) = text[pos..].find('>')
+        && best.as_ref().is_none_or(|b| pos < b.index)
+    {
+        let end = pos + gt + 1;
+        best = Some(TriggerMatch {
+            index: pos,
+            end_index: end,
+            open_tag: text[pos..end].to_string(),
+            close_tag: "</invoke>".to_string(),
+            kind: TriggerKind::Invoke,
+        });
+    }
+
+    best
+}
+
+/// 检测文本尾部是否可能是任意触发标签的前缀（用于流式缓冲保留）
+fn get_partial_trigger_tail_length(text: &str, tool_names: &[String]) -> usize {
+    // Per-tool XML 部分标签
+    let xml_len = get_partial_xml_tool_tag_tail_length(text, tool_names, false);
+
+    // 固定模式部分标签：<tool_calls>、<tool_call>、<invoke
+    let fixed_patterns: [&str; 3] = ["<tool_calls>", "<tool_call>", "<invoke "];
+    let mut fixed_len = 0;
+    for pat in fixed_patterns {
+        let max_prefix = pat.len().min(text.len());
+        // 从最长前缀开始缩短，检查 text 尾部是否匹配 pat 的前缀
+        let mut len = max_prefix;
+        while len > 0 {
+            if text.ends_with(&pat[..len]) {
+                break;
+            }
+            len -= 1;
+        }
+        if len > fixed_len {
+            fixed_len = len;
+        }
+    }
+
+    xml_len.max(fixed_len)
 }
 
 pin_project! {
@@ -687,16 +830,15 @@ where
                                 buffer.push_str(&content);
                                 let tool_names = &this.tag_config.tool_names;
 
-                                if let Some(open) =
-                                    find_first_xml_tool_tag(buffer, tool_names, false, 0)
-                                {
-                                    trace!(target: "adapter", ">>> 检测到开标签: name={}, buf_len={}", open.name, buffer.len());
+                                if let Some(open) = find_first_trigger(buffer, tool_names) {
+                                    trace!(target: "adapter", ">>> 检测到触发标签: kind={:?}, buf_len={}", open.kind, buffer.len());
                                     let before = buffer[..open.index].to_string();
                                     let rest = std::mem::take(buffer)[open.end_index..].to_string();
                                     *this.state = ToolParseState::Suppressing {
                                         body: rest,
-                                        tool_name: open.name,
-                                        open_tag: open.raw,
+                                        close_tag: open.close_tag,
+                                        open_tag: open.open_tag,
+                                        kind: open.kind,
                                     };
                                     choice.delta.content = if before.is_empty() {
                                         None
@@ -706,9 +848,8 @@ where
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
 
-                                // 未找到开标签，检查部分标签尾部
-                                let tail_len =
-                                    get_partial_xml_tool_tag_tail_length(buffer, tool_names, false);
+                                // 未找到触发标签，检查部分标签尾部
+                                let tail_len = get_partial_trigger_tail_length(buffer, tool_names);
                                 let safe = floor_char_boundary(
                                     buffer,
                                     buffer.len().saturating_sub(tail_len),
@@ -724,8 +865,9 @@ where
 
                             ToolParseState::Suppressing {
                                 body,
-                                tool_name,
+                                close_tag,
                                 open_tag,
+                                kind,
                             } => {
                                 body.push_str(&content);
                                 if body.len() > MAX_XML_BUF_LEN {
@@ -738,31 +880,37 @@ where
                                     return Poll::Ready(Some(Ok(chunk)));
                                 }
 
-                                // 查找闭标签
-                                let single_name = vec![tool_name.clone()];
-                                if let Some(close) =
-                                    find_first_xml_tool_tag(body, &single_name, true, 0)
-                                {
-                                    // 先克隆所需字段，再 take body，避免借用冲突
-                                    let tool_name_owned = tool_name.clone();
+                                // 查找闭标签（简单字符串搜索，适用于所有触发模式）
+                                if let Some(close_pos) = body.find(close_tag.as_str()) {
                                     let open_tag_owned = open_tag.clone();
+                                    let close_tag_owned = close_tag.clone();
+                                    let kind_owned = kind.clone();
                                     let full_body = std::mem::take(body);
-                                    let body_content = full_body[..close.index].to_string();
-                                    let rest = full_body[close.end_index..].to_string();
+                                    let body_content = full_body[..close_pos].to_string();
+                                    let rest =
+                                        full_body[close_pos + close_tag_owned.len()..].to_string();
 
-                                    // 解析工具调用
-                                    if let Some(mut call) =
-                                        parse_tool_call_body(&tool_name_owned, &body_content)
+                                    if let Some(calls) = kind_owned.parse(
+                                        &open_tag_owned,
+                                        &body_content,
+                                        &close_tag_owned,
+                                    ) && !calls.is_empty()
                                     {
                                         debug!(
                                             target: "adapter",
-                                            ">>> 解析出工具调用: {}", tool_name_owned
+                                            ">>> 解析出工具调用: {} 个", calls.len()
                                         );
-                                        call.index = *this.call_index;
-                                        *this.call_index += 1;
+                                        let indexed: Vec<ToolCall> = calls
+                                            .into_iter()
+                                            .map(|mut c| {
+                                                c.index = *this.call_index;
+                                                *this.call_index += 1;
+                                                c
+                                            })
+                                            .collect();
                                         *this.has_tool_calls = true;
                                         choice.delta.content = None;
-                                        choice.delta.tool_calls = Some(vec![call]);
+                                        choice.delta.tool_calls = Some(indexed);
                                         *this.state = ToolParseState::Normal { buffer: rest };
                                         return Poll::Ready(Some(Ok(chunk)));
                                     }
@@ -770,11 +918,12 @@ where
                                     // 解析失败，请求修复
                                     warn!(
                                         target: "adapter",
-                                        "tool_parser 解析失败→请求修复: {}",
-                                        tool_name_owned
+                                        "tool_parser 解析失败→请求修复: kind={:?}", kind_owned
                                     );
-                                    let tool_text =
-                                        format!("{}{}{}", open_tag_owned, body_content, close.raw);
+                                    let tool_text = format!(
+                                        "{}{}{}",
+                                        open_tag_owned, body_content, close_tag_owned
+                                    );
                                     *this.state = ToolParseState::Normal { buffer: rest };
                                     *this.repair_pending = Some(tool_text);
                                     return Poll::Ready(Some(Ok(chunk)));
@@ -803,32 +952,41 @@ where
                         }
                         ToolParseState::Suppressing {
                             body,
-                            tool_name,
+                            close_tag,
                             open_tag,
+                            kind,
                         } => {
                             if choice.finish_reason.is_some() {
-                                let tool_name_owned = tool_name.clone();
                                 let open_tag_owned = open_tag.clone();
+                                let close_tag_owned = close_tag.clone();
+                                let kind_owned = kind.clone();
                                 let full_body = std::mem::take(body);
                                 // body 中可能已包含闭标签，提取闭标签之前的内容
-                                let body_content = match find_first_xml_tool_tag(
-                                    &full_body,
-                                    std::slice::from_ref(&tool_name_owned),
-                                    true,
-                                    0,
-                                ) {
-                                    Some(close) => full_body[..close.index].to_string(),
+                                let body_content = match full_body.find(close_tag_owned.as_str()) {
+                                    Some(close_pos) => full_body[..close_pos].to_string(),
                                     None => full_body,
                                 };
-                                if let Some(mut call) =
-                                    parse_tool_call_body(&tool_name_owned, &body_content)
+                                if let Some(calls) = kind_owned.parse(
+                                    &open_tag_owned,
+                                    &body_content,
+                                    &close_tag_owned,
+                                ) && !calls.is_empty()
                                 {
-                                    debug!(target: "adapter", "tool_parser 流结束时解析出工具调用: {}", tool_name_owned);
-                                    call.index = *this.call_index;
-                                    *this.call_index += 1;
+                                    debug!(
+                                        target: "adapter",
+                                        "tool_parser 流结束时解析出工具调用: {} 个", calls.len()
+                                    );
+                                    let indexed: Vec<ToolCall> = calls
+                                        .into_iter()
+                                        .map(|mut c| {
+                                            c.index = *this.call_index;
+                                            *this.call_index += 1;
+                                            c
+                                        })
+                                        .collect();
                                     *this.has_tool_calls = true;
                                     choice.delta.content = None;
-                                    choice.delta.tool_calls = Some(vec![call]);
+                                    choice.delta.tool_calls = Some(indexed);
                                     if choice.finish_reason == Some("stop") {
                                         choice.finish_reason = Some("tool_calls");
                                     }
@@ -840,8 +998,8 @@ where
                                 }
                                 warn!(target: "adapter", "tool_parser 流结束→请求修复");
                                 let tool_text = format!(
-                                    "{}{}</{}>",
-                                    open_tag_owned, body_content, tool_name_owned
+                                    "{}{}{}",
+                                    open_tag_owned, body_content, close_tag_owned
                                 );
                                 *this.state = ToolParseState::Normal {
                                     buffer: String::new(),
@@ -912,29 +1070,35 @@ where
                         }
                         ToolParseState::Suppressing {
                             body,
-                            tool_name,
+                            close_tag,
                             open_tag,
+                            kind,
                         } => {
                             // body 中可能已包含闭标签，提取闭标签之前的内容
-                            let body_content = match find_first_xml_tool_tag(
-                                &body,
-                                std::slice::from_ref(&tool_name),
-                                true,
-                                0,
-                            ) {
-                                Some(close) => body[..close.index].to_string(),
+                            let body_content = match body.find(close_tag.as_str()) {
+                                Some(close_pos) => body[..close_pos].to_string(),
                                 None => body,
                             };
-                            if let Some(mut call) = parse_tool_call_body(&tool_name, &body_content)
+                            if let Some(calls) = kind.parse(&open_tag, &body_content, &close_tag)
+                                && !calls.is_empty()
                             {
-                                debug!(target: "adapter", "tool_parser 流结束时解析出工具调用: {}", tool_name);
-                                call.index = *this.call_index;
-                                *this.call_index += 1;
+                                debug!(
+                                    target: "adapter",
+                                    "tool_parser 流结束时解析出工具调用: {} 个", calls.len()
+                                );
+                                let indexed: Vec<ToolCall> = calls
+                                    .into_iter()
+                                    .map(|mut c| {
+                                        c.index = *this.call_index;
+                                        *this.call_index += 1;
+                                        c
+                                    })
+                                    .collect();
                                 *this.has_tool_calls = true;
                                 let chunk = make_end_chunk(
                                     this.model,
                                     Delta {
-                                        tool_calls: Some(vec![call]),
+                                        tool_calls: Some(indexed),
                                         ..Default::default()
                                     },
                                     "tool_calls",
@@ -942,7 +1106,7 @@ where
                                 return Poll::Ready(Some(Ok(chunk)));
                             }
                             warn!(target: "adapter", "tool_parser 流结束→请求修复");
-                            let tool_text = format!("{}{}</{}>", open_tag, body_content, tool_name);
+                            let tool_text = format!("{}{}{}", open_tag, body_content, close_tag);
                             return Poll::Ready(Some(Err(
                                 OpenAIAdapterError::ToolCallRepairNeeded(tool_text),
                             )));
