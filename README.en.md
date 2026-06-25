@@ -24,18 +24,34 @@ A Rust API proxy that translates DeepSeek's free web chat into standard OpenAI a
 
 - **Zero-cost API proxy**: Uses DeepSeek's free web interface — no official API key needed, get OpenAI/Anthropic-compatible endpoints for free
 - **Dual protocol support**: Both OpenAI Chat Completions and Anthropic Messages API, drop-in compatible with mainstream clients
-- **Tool call ready**: Full OpenAI function calling implementation with a 3-tier self-healing pipeline (text repair → JSON repair → model fallback), covering 10+ malformed formats
+- **Tool call ready**: Full OpenAI function calling implementation using a per-tool XML tag strategy (ported from [deepseek-pp](https://github.com/qoomezhu/deepseek-pp)) to avoid fixed-tag fingerprinting and account bans; tool parsing + 3-tier self-healing pipeline (text repair → JSON repair → model fallback), covering 10+ malformed formats
 - **File upload ready**: Inline data URL files in OpenAI `file`/`image_url` content parts and Anthropic `image`/`document` content blocks are automatically uploaded to DeepSeek sessions; HTTP URLs trigger search mode so the model can access link content directly
 - **Oversized prompt fallback**: When the prompt exceeds model limits, automatically falls back to chunked completion with file upload
 - **Web admin panel**: Built-in dashboard for account pool status, API key management, request logs, i18n internationalization, theme switcher, and hot-reloadable config — ready out of the box
-- **Built with Rust**: Single binary + single TOML config, cross-platform native performance (web panel compiled in at build time)
+- **Pure Rust**: Single binary + single TOML config, cross-platform native performance (web panel compiled in at build time), no runtime interpreter dependencies
 - **Multi-account pool**: Idle-aware round-robin selection (DashMap lock-free reads), horizontal scaling for concurrency
+- **Native ARM support**: CI builds 8 targets (including 4 ARM), provides multi-arch Docker images, runs out of the box on ARM servers
 
 ## Quick Start
+
+### Docker Deployment (Recommended, ARM/x86 supported)
+
+```bash
+docker compose -f docker/docker-compose.yaml up -d
+```
+
+The image automatically supports both `linux/amd64` and `linux/arm64` architectures — ARM servers can pull directly.
+
+The admin panel is at `http://localhost:22217/admin`. Set your admin password on first visit.
+The `config/` and `data/` directories are bind-mounted into the container — config changes persist to the host automatically.
 
 ### Binary Usage
 
 1. Download and extract the archive for your platform from [releases](https://github.com/NIyueeE/ds-free-api/releases)
+   - Linux x86: `linux-x86_64-gnu.tar.gz` or `linux-x86_64-musl.tar.gz` (statically linked)
+   - Linux ARM: `linux-aarch64-gnu.tar.gz` or `linux-aarch64-musl.tar.gz`
+   - macOS: `macos-x86_64.tar.gz` or `macos-aarch64.tar.gz`
+   - Windows: `windows-x86_64.zip` or `windows-aarch64.zip`
 2. Copy `config.example.toml` to `config.toml` and fill in accounts (optional — you can also configure via the admin panel after startup)
 3. Run `./ds-free-api`
 4. Visit `http://127.0.0.1:22217/admin` to set an admin password, then manage API keys and accounts from the panel
@@ -49,16 +65,22 @@ RUST_LOG=debug ./ds-free-api
 > **Concurrency**: The free API has session-level rate limits. This project has built-in rate-limit detection + exponential backoff retry for stability.
 > Recommended parallelism = accounts / 2. Supports starting without `config.toml` and adding accounts via the admin panel.
 
-### Docker Usage
+### Build from Source
+
+> Build dependencies: Rust 1.95+, Bun 1.3+, `cmake`, `g++`, `libclang-dev` (for compiling wreq's BoringSSL). These are build-time only — the runtime binary has no external dependencies.
 
 ```bash
-docker compose -f docker/docker-compose.yaml up -d
+# 1. Build frontend (compiled into the binary)
+cd web && bun install && bun run build && cd ..
+
+# 2. Build release binary
+cargo build --release
+
+# 3. Run
+./target/release/ds-free-api
 ```
 
-Refer to the [sample compose file](./docker/docker-compose.yaml) for reference.
-
-The admin panel is at `http://localhost:22217/admin`. Set your admin password on first visit.
-The `config/` and `data/` directories are bind-mounted into the container — config changes persist to the host automatically.
+ARM servers can compile natively: `cargo build --release` (same build dependencies required).
 
 ### Free Test Accounts
 
@@ -119,12 +141,39 @@ The Anthropic compatibility layer uses the same model IDs via `/anthropic/v1/mes
   {"type": "image", "source": {"type": "url", "url": "https://example.com/img.jpg"}}
   ```
 
-### Tool Call Tags
+### Tool Calling (function calling)
 
-Uses a per-tool XML tag strategy: each tool has its own tag `<tool_name>{json}</tool_name>`, where the tag name is the tool name (auto-extracted from the request's tools definition). If the model outputs tool tags not defined in the request's tools, add them via the admin panel or in `config.toml` under `[ds_core]`:
+This project uses a **per-tool XML tag strategy** (ported from [deepseek-pp](https://github.com/qoomezhu/deepseek-pp)): each tool has its own tag `<tool_name>{json}</tool_name>`, where the tag name is the tool name (auto-extracted from the request's `tools` definition).
+
+> **Why not fixed tags?** The original project used `<|tool▁calls▁begin|>` fixed tags + a single JSON array format, which was eventually recognized as a machine fingerprint by DeepSeek's web backend, triggering account bans. Per-tool XML tags vary with tool names, closer to natural human conversation, avoiding fingerprint detection. See [docs/deepseek-prompt-injection.md](./docs/deepseek-prompt-injection.md).
+
+**Tool definition injection format** (injected at the end of the System message, conversational natural language description):
+
+```
+## Tools
+
+### Tool get_weather
+Description: Get weather info for a city
+Valid call format for get_weather:
+<get_weather>
+{"city": "Beijing"}
+</get_weather>
+Parameters JSON Schema: {"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
+```
+
+**Model output example**:
+
+```
+<get_weather>
+{"city": "Beijing"}
+</get_weather>
+```
+
+**Configure extra tool names**: If the model outputs tool tags not defined in the request's `tools`, add them via the admin panel or in `config.toml` under `[ds_core.tool_call]`:
 
 ```toml
-tool_call.extra_tool_names = ["custom_tool_a", "custom_tool_b"]
+[ds_core.tool_call]
+extra_tool_names = ["custom_tool_a", "custom_tool_b"]
 ```
 
 ## Web Admin Panel
@@ -257,7 +306,7 @@ flowchart TB
         Q1["ChatCompletionsRequest"]:::openai_adapter
         Q2["Validation + Defaults"]:::step
         Q3["Extract tools/files + inject prompts"]:::step
-        Q4["Build DeepSeek native tag prompt"]:::step
+        Q4["Per-tool XML tool prompt build"]:::step
         Q5["Model mapping + capability toggles"]:::step
         Q6["Retry with exp. backoff<br/>1s→2s→4s→8s→16s"]:::step
         Q7["ChatRequest"]:::ds_core
@@ -277,7 +326,7 @@ flowchart TB
         OS1["ds_core SSE stream"]:::ds_core
         OS2["SSE frame parse + state machine"]:::step
         OS3["Chunk conversion<br/>DsFrame → ChatCompletionsResponseChunk"]:::step
-        OS4["Tool call XML parse"]:::step
+        OS4["Per-tool XML tool call parse"]:::step
         OS5["Malformed tool call repair"]:::step
         OS6["Stop sequence detect + obfuscation"]:::step
         OS7["ChatCompletionsResponseChunk"]:::openai_adapter

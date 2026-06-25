@@ -4,13 +4,15 @@
 
 - Rust **1.95.0+**（见 `rust-toolchain.toml`）
 - Bun **1.3+**（Web 面板构建与开发）
-- `cmake`、`g++`、`libclang-dev`（编译 `wreq` 依赖的 BoringSSL）
+- `cmake`、`g++`、`libclang-dev`（编译 `wreq` 依赖的 BoringSSL，仅编译期需要）
 - `just` 命令运行器（用于 `just serve` / `just check` 等快捷命令）
+
+> 运行时无任何外部依赖，单二进制即可运行。
 
 ## 首次启动
 
 ```bash
-# 1. 复制配置
+# 1. 复制配置（可选，首次启动会自动创建最小配置）
 cp config.example.toml config.toml
 
 # 2. 构建 Web 前端（编译时嵌入二进制，每次前端变更需要重构建）
@@ -42,58 +44,125 @@ cargo build --release
 Release 二进制通过 `rust_embed` 编译时嵌入前端资源，`web/dist/` 目录不存在时
 自动使用嵌入资源。发布版无需额外文件。
 
+### ARM 服务器本地编译
+
+ARM 服务器（如 Ampere Altra、AWS Graviton、Apple Silicon）可直接本地编译：
+
+```bash
+# 安装编译依赖（Debian/Ubuntu）
+sudo apt-get install -y cmake g++ libclang-dev
+
+# 构建前端（若已安装 Bun）
+cd web && bun install && bun run build && cd ..
+
+# 编译
+cargo build --release
+./target/release/ds-free-api
+```
+
+无需交叉编译配置，原生 ARM 工具链即可。
+
 ## CI 自动构建
 
-GitHub Actions（`.github/workflows/release.yml`）在 tag push 时自动执行：
+GitHub Actions（`.github/workflows/release.yml`）在 tag push 时自动执行 8 个目标的构建：
 
 ```
 build-frontend (bun install --frozen-lockfile + bun run build)
-  ├── build-linux-gnu (cargo build)     │
-  ├── build-linux-musl (musl-cross)     │── release (tar.gz + zip)
-  ├── build-macos (cargo build)  │
-  └── build-windows (cargo build)│
-  └── docker (ghcr.io image)
+  ├── build-linux-gnu    (x86_64 + aarch64)     ┐
+  ├── build-linux-musl   (x86_64 + aarch64)     │
+  ├── build-macos        (x86_64 + aarch64)     ┼── release (tar.gz + zip + SHA256SUMS)
+  └── build-windows      (x86_64 + aarch64)     ┘
+  └── docker (multi-arch: linux/amd64 + linux/arm64 → ghcr.io)
 ```
 
-`build-frontend` 产出 `web-dist` artifact，各编译 job 下载后再执行 `cargo build` /
-`cross build`，保证 `rust_embed` 嵌入真实前端文件。
+**构建矩阵**：
 
-Docker 镜像自动推送到 `ghcr.io/niyueee/ds-free-api:latest`。
+| 平台 | Target | 说明 |
+| --- | --- | --- |
+| Linux x86 (glibc) | `x86_64-unknown-linux-gnu` | 原生 x86 runner |
+| Linux ARM (glibc) | `aarch64-unknown-linux-gnu` | 原生 ARM runner (`ubuntu-24.04-arm`) |
+| Linux x86 (musl, 静态) | `x86_64-unknown-linux-musl` | musl-cross 交叉编译 |
+| Linux ARM (musl, 静态) | `aarch64-unknown-linux-musl` | musl-cross 交叉编译 |
+| macOS x86 | `x86_64-apple-darwin` | Intel Mac |
+| macOS ARM | `aarch64-apple-darwin` | Apple Silicon |
+| Windows x86 | `x86_64-pc-windows-msvc` | |
+| Windows ARM | `aarch64-pc-windows-msvc` | |
+
+`build-frontend` 产出 `web-dist` artifact，各编译 job 下载后再执行 `cargo build`，
+保证 `rust_embed` 嵌入真实前端文件。
+
+Docker 镜像自动推送到 `ghcr.io/qoomezhu/ds-free-api:latest`（multi-arch，同时支持 amd64 和 arm64）。
 
 ## Docker 部署（生产）
 
-从 ghcr.io 拉取（推荐）：
+### 方式一：从 ghcr.io 拉取（推荐）
 
 ```bash
-# 确认已创建 docker/config/ 目录（自动创建或手动 mkdir）
+# ARM 服务器和 x86 服务器均可直接使用，Docker 自动选择对应架构
 docker compose -f docker/docker-compose.yaml up -d
 ```
 
 容器首次启动时自动创建最小配置，无需提前准备 `config.toml`。
 配置和数据通过 bind mount 持久化到宿主机的 `docker/config/` 和 `docker/data/`。
 
-从源码构建本地 Docker 镜像：
+### 方式二：本地构建镜像
+
+从源码构建本地 Docker 镜像（用于开发或定制）：
 
 ```bash
-# 1. 构建前端 + 交叉编译二进制
+# 1. 构建前端 + 编译二进制（当前平台）
 cd web && bun install && bun run build && cd ..
-cargo zigbuild --release --target x86_64-unknown-linux-gnu
+cargo build --release
 
-# 2. 构建 Docker 镜像
+# 2. 准备 Docker 构建上下文（按 docker/Dockerfile 要求放置二进制）
+mkdir -p target/docker/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+cp target/release/ds-free-api target/docker/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/
+
+# 3. 构建 Docker 镜像
 docker build -f docker/Dockerfile -t ds-free-api .
 
-# 3. 导出并传输到服务器
+# 4. 导出并传输到服务器
 docker save ds-free-api | gzip > ds-free-api.tar.gz
 scp ds-free-api.tar.gz user@server:/tmp/
 
-# 4. 服务器加载并启动
+# 5. 服务器加载并启动
 ssh user@server
 docker load < /tmp/ds-free-api.tar.gz
 docker compose -f docker/docker-compose.yaml up -d
 ```
 
-> 服务器原生 x86 环境可直接在服务器上执行上述构建，速度更快。
+> 服务器原生环境（x86 或 ARM）可直接在服务器上执行上述构建，速度更快。
 > Docker 镜像仅包含预编译二进制 + 嵌入的前端资源，无需在容器内编译。
+
+## 部署到 ARM 服务器
+
+本项目原生支持 ARM 架构，三种部署方式任选：
+
+### 1. Docker（最简单）
+
+```bash
+# ARM 服务器直接拉取，Docker 自动选择 arm64 manifest
+docker pull ghcr.io/qoomezhu/ds-free-api:latest
+docker compose -f docker/docker-compose.yaml up -d
+```
+
+### 2. 预编译二进制
+
+从 GitHub Release 下载 ARM 二进制：
+
+```bash
+# ARM 服务器（glibc，如 Ubuntu/Debian on ARM）
+wget https://github.com/qoomezhu/ds-free-api/releases/latest/download/ds-free-api-vX.Y.Z-linux-aarch64-gnu.tar.gz
+tar xzf ds-free-api-*.tar.gz && cd ds-free-api-*
+./ds-free-api -c config.toml
+
+# 或 musl 静态版（任意 ARM Linux，无 glibc 版本要求）
+wget https://github.com/qoomezhu/ds-free-api/releases/latest/download/ds-free-api-vX.Y.Z-linux-aarch64-musl.tar.gz
+```
+
+### 3. 源码编译
+
+见上方"ARM 服务器本地编译"章节。
 
 ## 命令参考
 
@@ -218,6 +287,20 @@ just e2e-stress --filter 修复 --iterations 5
 # 输出 JSON 报告
 just e2e-basic --report result.json
 ```
+
+## 发布新版本
+
+1. 更新 `Cargo.toml` 中的 `version` 字段
+2. 在 `CHANGELOG.md` 中添加对应版本的变更记录
+3. 提交并打 tag：
+
+```bash
+git tag v0.x.x
+git push origin v0.x.x
+```
+
+CI 自动触发 8 平台构建 + Docker multi-arch 推送 + GitHub Release（draft），
+版本号需与 `Cargo.toml` 一致（CI 会校验）。
 
 ## 更多文档
 
