@@ -66,6 +66,43 @@ pub struct DsCoreSection {
     /// 工具调用标签配置（自定义回退标签）
     #[serde(default)]
     pub tool_call: ToolCallTagConfig,
+    /// 反代行为伪装配置（请求抖动、单账号日请求上限）
+    #[serde(default)]
+    pub behavior: BehaviorSection,
+}
+
+/// 反代行为伪装配置 —— 对应 config.toml 的 [ds_core.behavior]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BehaviorSection {
+    /// 请求前随机延迟范围（毫秒）：[min, max]
+    ///
+    /// 真实浏览器发消息前有思考、打字停顿，固定间隔会被识别为机械行为。
+    /// 设为 [0, 0] 可禁用抖动。
+    #[serde(default = "default_request_jitter_ms")]
+    pub request_jitter_ms: [u64; 2],
+    /// 单账号每日请求上限，达到后该账号当日不再被选中
+    ///
+    /// 真实用户每日对话量有限，单账号高频调用会触发 DeepSeek 黄色熔断。
+    /// 设为 0 表示不限制。
+    #[serde(default = "default_daily_request_limit")]
+    pub daily_request_limit: u32,
+}
+
+impl Default for BehaviorSection {
+    fn default() -> Self {
+        Self {
+            request_jitter_ms: default_request_jitter_ms(),
+            daily_request_limit: default_daily_request_limit(),
+        }
+    }
+}
+
+fn default_request_jitter_ms() -> [u64; 2] {
+    [500, 3000]
+}
+
+fn default_daily_request_limit() -> u32 {
+    80
 }
 
 impl DsCoreSection {
@@ -368,6 +405,7 @@ impl Default for DsCoreSection {
             input_character_limits: default_input_character_limits(),
             model_aliases: Vec::new(),
             tool_call: ToolCallTagConfig::default(),
+            behavior: BehaviorSection::default(),
         }
     }
 }

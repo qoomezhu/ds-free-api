@@ -47,6 +47,8 @@ impl Accounts {
         let solver = PowSolver::new(&wasm_bytes)?;
 
         let pool = AccountPool::new();
+        pool.set_daily_request_limit(config.behavior.daily_request_limit)
+            .await;
         pool.init(account_creds, &client, &solver)
             .await
             .map_err(|e| match e {
@@ -265,6 +267,9 @@ impl Accounts {
 
         self.pool
             .set_client_solver(client.clone(), solver.clone())
+            .await;
+        self.pool
+            .set_daily_request_limit(config.behavior.daily_request_limit)
             .await;
         *self.client.write().await = client;
         *self.solver.write().await = solver;

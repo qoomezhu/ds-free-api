@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::Stream;
 
-use ds_core::{AccountConfig, CoreError, DsCore, DsCoreConfig};
+use ds_core::{AccountConfig, BehaviorConfig, CoreError, DsCore, DsCoreConfig};
 use std::collections::HashMap;
 
 mod models;
@@ -27,6 +27,21 @@ pub type StreamResponse = Pin<Box<dyn Stream<Item = Result<Bytes, OpenAIAdapterE
 /// 流式响应结构体流
 pub type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>>;
+
+/// 将根 crate 的 `BehaviorSection` 转换为 `ds_core::BehaviorConfig`
+///
+/// 校验 jitter 范围合法性：min > max 时交换；两者皆为 0 表示禁用抖动
+fn behavior_cfg_from(s: &crate::config::BehaviorSection) -> BehaviorConfig {
+    let mut min = s.request_jitter_ms[0];
+    let mut max = s.request_jitter_ms[1];
+    if min > max {
+        std::mem::swap(&mut min, &mut max);
+    }
+    BehaviorConfig {
+        request_jitter_ms: (min, max),
+        daily_request_limit: s.daily_request_limit,
+    }
+}
 
 /// Chat Completions 统一输出
 pub enum ChatOutput {
@@ -67,6 +82,7 @@ impl OpenAIAdapter {
             proxy_url: config.proxy.url.clone(),
             model_types: config.ds_core.model_types.clone(),
             input_character_limits: config.ds_core.input_character_limits.clone(),
+            behavior: behavior_cfg_from(&config.ds_core.behavior),
         };
         let accounts: Vec<AccountConfig> = config
             .ds_core
@@ -492,6 +508,7 @@ impl OpenAIAdapter {
             proxy_url: new_config.proxy.url.clone(),
             model_types: new_config.ds_core.model_types.clone(),
             input_character_limits: new_config.ds_core.input_character_limits.clone(),
+            behavior: behavior_cfg_from(&new_config.ds_core.behavior),
         };
         self.ds_core.reload_config(&core_cfg).await
     }

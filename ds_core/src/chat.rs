@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::accounts::Accounts;
-use crate::config::DsCoreConfig;
+use crate::config::{BehaviorConfig, DsCoreConfig};
 use response::ActiveSession;
 
 pub use request::{ChatRequest, ChatResponse, FilePayload};
@@ -24,6 +24,7 @@ pub struct Chat {
     active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     model_types: Vec<String>,
     input_character_limits: Vec<u32>,
+    behavior: BehaviorConfig,
 }
 
 impl Chat {
@@ -34,6 +35,28 @@ impl Chat {
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
             model_types: config.model_types.clone(),
             input_character_limits: config.input_character_limits.clone(),
+            behavior: config.behavior.clone(),
+        }
+    }
+
+    /// 请求前随机延迟，模拟真实浏览器的思考/打字停顿
+    ///
+    /// jitter 范围为 (0, 0) 时禁用。使用纳秒时间戳的低 32 位做轻量随机源，
+    /// 避免引入 rand 依赖。
+    async fn apply_request_jitter(&self) {
+        let (min, max) = self.behavior.request_jitter_ms;
+        if max == 0 {
+            return;
+        }
+        let bound = (max - min).max(1);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()))
+            .unwrap_or(0);
+        let extra = (nanos % bound).min(bound - 1);
+        let delay = min + extra;
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
     }
 

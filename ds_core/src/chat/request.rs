@@ -59,6 +59,9 @@ impl Chat {
         req: ChatRequest,
         request_id: &str,
     ) -> Result<ChatResponse, CoreError> {
+        // 请求前随机延迟，模拟真实浏览器节奏
+        self.apply_request_jitter().await;
+
         let limit = self.input_character_limit_for(&req.model_type);
         let threshold = (limit as u64 * 75 / 100) as usize;
         let oversized = req.prompt.chars().count() > threshold;

@@ -66,6 +66,14 @@ port = 22217
 # 但模型可能输出的工具标签名）。
 # tool_call.extra_tool_names = ["custom_tool_a", "custom_tool_b"]
 
+# 反代行为伪装配置（降低封号风险）
+# [ds_core.behavior]
+# 请求前随机延迟范围（毫秒），模拟真实浏览器的思考/打字停顿。设为 [0, 0] 禁用。
+# request_jitter_ms = [500, 3000]
+# 单账号每日请求上限，达到后该账号当日不再被选中。设为 0 表示不限制。
+# 建议值 50-100，真实用户每日对话量有限，高频调用会触发 DeepSeek 黄色熔断。
+# daily_request_limit = 80
+
 # Admin 配置（由管理面板自动管理，部署时无需手动填写）
 # [admin]
 # password_hash = ""

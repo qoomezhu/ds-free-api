@@ -3,7 +3,7 @@
 //! 1 account = 1 session = 1 concurrency。多并发需横向扩展账号数。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, Ordering};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
@@ -68,6 +68,10 @@ pub struct Account {
     error_count: AtomicU8,
     /// 原始凭据（用于重新登录）
     creds: AccountConfig,
+    /// 当日已发起的请求数（UTC 日期切换时重置）
+    daily_count: AtomicU32,
+    /// daily_count 对应的 UTC 日期序号（自纪元起的天数），用于跨日重置
+    daily_day: AtomicU32,
 }
 
 /// 连续登录失败上限，达到后标记为 Invalid
@@ -98,6 +102,39 @@ impl Account {
         self.state() == AccountState::Idle
     }
 
+    /// 当日已发起的请求数。跨日时返回 0（内部自动重置）。
+    pub fn daily_count(&self) -> u32 {
+        let today = utc_day_index();
+        let stored_day = self.daily_day.load(Ordering::Relaxed);
+        if stored_day != today {
+            // 跨日：尝试重置计数。并发场景下失败的线程读到已重置的值即可
+            if self
+                .daily_day
+                .compare_exchange(stored_day, today, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.daily_count.store(0, Ordering::Relaxed);
+            }
+        }
+        self.daily_count.load(Ordering::Relaxed)
+    }
+
+    /// 递增当日请求计数（在账号被选中后调用）。跨日自动重置为 1。
+    pub fn inc_daily_count(&self) {
+        let today = utc_day_index();
+        let stored_day = self.daily_day.load(Ordering::Relaxed);
+        if stored_day != today
+            && self
+                .daily_day
+                .compare_exchange(stored_day, today, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.daily_count.store(1, Ordering::Relaxed);
+            return;
+        }
+        self.daily_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 创建一个 Invalid 状态的账号（初始化失败时使用，仍加入池以便前台展示）
     fn new_invalid(creds: AccountConfig) -> Self {
         Self {
@@ -108,8 +145,18 @@ impl Account {
             last_released: AtomicI64::new(0),
             error_count: AtomicU8::new(MAX_ERROR_COUNT),
             creds,
+            daily_count: AtomicU32::new(0),
+            daily_day: AtomicU32::new(utc_day_index()),
         }
     }
+}
+
+/// 当前 UTC 日期序号（自纪元起的天数），用于跨日重置 daily_count
+fn utc_day_index() -> u32 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as u32)
+        .unwrap_or(0)
 }
 
 /// 持有期间账号标记为 busy，Drop 时自动释放
@@ -148,6 +195,8 @@ pub struct AccountPool {
     accounts: DashMap<String, Arc<Account>>,
     client: RwLock<Option<DsClient>>,
     solver: RwLock<Option<PowSolver>>,
+    /// 单账号每日请求上限，0 表示不限制（来自 BehaviorConfig，热更新生效）
+    daily_request_limit: RwLock<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -187,7 +236,13 @@ impl AccountPool {
             accounts: DashMap::new(),
             client: RwLock::new(None),
             solver: RwLock::new(None),
+            daily_request_limit: RwLock::new(0),
         }
+    }
+
+    /// 设置单账号每日请求上限（0 表示不限制），热更新时调用
+    pub async fn set_daily_request_limit(&self, limit: u32) {
+        *self.daily_request_limit.write().await = limit;
     }
 
     pub async fn init(
@@ -318,11 +373,15 @@ impl AccountPool {
     /// 获取空闲最久的可用账号（不等待，立即返回）
     ///
     /// 遍历所有账号，选冷却已过且空闲时间最长的那个，最大化每次使用间隔。
+    /// 跳过已达当日请求上限的账号（若配置了上限）。
     /// DashMap 无锁读，不阻塞并发请求。
     pub fn get_account(&self) -> Option<AccountGuard> {
         if self.accounts.is_empty() {
             return None;
         }
+
+        // 读取日上限配置（0 表示不限制）。try_read 避免热更新写阻塞时卡住选号
+        let daily_limit = self.daily_request_limit.try_read().map(|l| *l).unwrap_or(0);
 
         let d = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -335,6 +394,10 @@ impl AccountPool {
         for entry in self.accounts.iter() {
             let account = entry.value();
             if !account.is_available() {
+                continue;
+            }
+            // 当日请求已达上限的账号跳过
+            if daily_limit > 0 && account.daily_count() >= daily_limit {
                 continue;
             }
             let idle = now_ms - account.last_released.load(Ordering::Relaxed);
@@ -354,6 +417,8 @@ impl AccountPool {
                 Ordering::Relaxed,
             )
             .ok()?;
+        // 选中后递增当日计数（即使后续请求失败也计数，避免失败重试绕过限制）
+        account.inc_daily_count();
         Some(AccountGuard { account })
     }
 
@@ -564,6 +629,8 @@ async fn try_init_account(
         last_released: AtomicI64::new(0),
         error_count: AtomicU8::new(0),
         creds: creds.clone(),
+        daily_count: AtomicU32::new(0),
+        daily_day: AtomicU32::new(utc_day_index()),
     })
 }
 

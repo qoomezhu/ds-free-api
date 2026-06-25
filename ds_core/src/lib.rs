@@ -9,7 +9,7 @@ mod config;
 pub use accounts::PoolError;
 pub use accounts::pool::AccountStatus;
 pub use chat::{ChatRequest, ChatResponse, FilePayload, StreamEvent};
-pub use config::{AccountConfig, DsCoreConfig};
+pub use config::{AccountConfig, BehaviorConfig, DsCoreConfig};
 
 use accounts::Accounts;
 use chat::Chat;
