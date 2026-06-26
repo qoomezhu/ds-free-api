@@ -7,6 +7,32 @@
 use super::tools::ToolContext;
 use crate::openai_adapter::types::{ChatCompletionsRequest, ContentPart, Message, MessageContent};
 
+/// 请求级随机源：用 SystemTime 纳秒低 32 位做轮换索引，无需引入 rand 依赖
+fn jitter_index(bound: usize) -> usize {
+    if bound <= 1 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    (nanos % bound as u64) as usize
+}
+
+/// 工具调用指令文本变体（都要求模型用 per-tool XML 输出，措辞不同）
+///
+/// 反代加固：避免每次请求出现完全相同的指令字符串被后端识别为机器特征。
+/// 所有变体语义等价，均禁止 `<invoke>`/`<tool_call>` 包装格式。
+fn tool_instruction_text() -> &'static str {
+    const VARIANTS: [&str; 4] = [
+        "使用工具时，请直接输出对应工具的 XML 标签（如 `<tool_name>{{...}}</tool_name>`）。不要使用 `<invoke name=\"...\">...</invoke>` 或 `<tool_call>...</tool_call>` 等包装格式。",
+        "调用工具请输出形如 `<tool_name>{{...}}</tool_name>` 的 XML 标签，禁止使用 `<invoke>` 或 `<tool_call>` 包装。",
+        "工具调用格式：直接输出 `<tool_name>{{...}}</tool_name>`，不要包裹在 `<invoke>`/`<tool_call>` 中。",
+        "如需调用工具，请以 `<tool_name>{{...}}</tool_name>` 格式输出，避免使用 `<invoke>` 或 `<tool_call>` 标签。",
+    ];
+    VARIANTS[jitter_index(VARIANTS.len())]
+}
+
 /// 合并连续相同 role 的 message，避免 DeepSeek 模型对连续同角色标签产生混淆
 fn merge_messages(messages: &[Message]) -> Vec<Message> {
     let mut merged: Vec<Message> = Vec::new();
@@ -130,7 +156,7 @@ pub(crate) fn build(req: &ChatCompletionsRequest, tool_ctx: &ToolContext) -> Str
     let mut sections: Vec<String> = Vec::new();
 
     if let Some(text) = tool_ctx.defs_text.as_deref() {
-        sections.push(format!("## Tools\n\n{text}\n\n使用工具时，请直接输出对应工具的 XML 标签（如 `<tool_name>{{...}}</tool_name>`）。不要使用 `<invoke name=\"...\">...</invoke>` 或 `<tool_call>...</tool_call>` 等包装格式。"));
+        sections.push(format!("## Tools\n\n{text}\n\n{}", tool_instruction_text()));
     }
     if let Some(text) = tool_ctx.instruction_text.as_deref() {
         sections.push(format!("## 调用指令\n{text}"));

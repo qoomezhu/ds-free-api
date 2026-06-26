@@ -177,7 +177,7 @@ Chat routes based on whether prompt character count exceeds 75% of the model lim
 | Oversized + `model_type=expert` | `v0_chat_oversized_chunk` | Chunked session write, last chunk normal |
 | Oversized + other model_type | `v0_chat_oversized_file` | Split history as file upload |
 
-**History split logic**: Dialogue before the last `<｜Assistant｜>` block is wrapped as `[file content end]` … `[file content begin]` and uploaded as a txt file; the last assistant block + latest user message are sent inline.
+**History split logic**: Dialogue before the last `<｜Assistant｜>` block is wrapped with file-content markers (`[file content end]`/`[文档结束]`/`[content end]` variants randomly rotated for anti-detection) and uploaded as a **randomly-named** txt file (e.g. `notes-xxxxxx.txt`); the last assistant block + latest user message are sent inline.
 
 ## Error Handling Chain
 

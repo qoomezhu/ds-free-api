@@ -3,11 +3,32 @@
 //! 采用 deepseek-pp 的 per-tool XML 标签策略：每个工具使用独立标签
 //! `<tool_name>{json}</tool_name>`，标签名即工具名，标签体为 JSON 参数对象。
 //! 工具 schema 以对话式自然语言描述呈现，避免 rigid rules 和重复提醒。
+//!
+//! 反代加固：schema 描述行与指令文本每次请求在多个等价变体中随机轮换，
+//! 避免固定字符串被 DeepSeek 后端识别为机器特征。
 
 use crate::openai_adapter::types::{
     AllowedTools, AllowedToolsChoice, ChatCompletionsRequest, CustomTool, CustomToolFormat,
     FunctionDefinition, Tool, ToolChoice,
 };
+
+/// 请求级随机源：用 SystemTime 纳秒低 32 位做轮换索引，无需引入 rand 依赖
+fn jitter_index(bound: usize) -> usize {
+    if bound <= 1 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    (nanos % bound as u64) as usize
+}
+
+/// schema 描述行前缀变体（"Description:" 等价替换，测试不依赖此字段）
+fn desc_prefix() -> &'static str {
+    const VARIANTS: [&str; 3] = ["Description:", "功能描述:", "说明:"];
+    VARIANTS[jitter_index(VARIANTS.len())]
+}
 
 /// 提取后的工具上下文
 pub(crate) struct ToolContext {
@@ -186,10 +207,11 @@ fn render_function_schema(func: &FunctionDefinition) -> Result<String, String> {
     let example = example_payload(name);
 
     let mut block = format!("### Tool {name}\n");
+    let desc_label = desc_prefix();
     if description.is_empty() {
-        block.push_str("Description: (无描述)\n");
+        block.push_str(&format!("{desc_label} (无描述)\n"));
     } else {
-        block.push_str(&format!("Description: {description}\n"));
+        block.push_str(&format!("{desc_label} {description}\n"));
     }
     block.push_str(&format!("Valid call format for {name}:\n"));
     block.push_str(&format!("<{name}>\n{example}\n</{name}>\n"));
@@ -210,10 +232,11 @@ fn render_custom_schema(custom: &CustomTool) -> String {
     };
 
     let mut block = format!("### Tool {name} (custom, format: {method})\n");
+    let desc_label = desc_prefix();
     if description.is_empty() {
-        block.push_str("Description: (无描述)\n");
+        block.push_str(&format!("{desc_label} (无描述)\n"));
     } else {
-        block.push_str(&format!("Description: {description}\n"));
+        block.push_str(&format!("{desc_label} {description}\n"));
     }
     block.push_str(&format!("Valid call format for {name}:\n"));
     block.push_str(&format!("<{name}>\n(自定义格式内容)\n</{name}>"));
