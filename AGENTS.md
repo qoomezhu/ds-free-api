@@ -224,14 +224,14 @@ Each account retries 3x with 2s delay on failure. If an account fails all retrie
 
 ### Request Flow (per-chat)
 
-`v0_chat()` → `get_account()` → `split_history()` → `create_session()` → `upload_files()` → `compute_pow()` → `completion()` → `parse_ready()` → `GuardedStream`
+`v0_chat()` → `apply_request_jitter` → 字符数判断路径 → `get_account()` → `create_session()` →（可选）`upload_files()` / chunked 串接 → `compute_pow()` → `completion()` → `parse_ready()` → `ResponseStream`
 
-Each `v0_chat()` call creates a dedicated session, uploads multi-turn history as files, then streams the response. The response is a `StreamEvent` stream (not raw SSE bytes) — the new **精简响应协议** abstracts away DeepSeek's p/o/v patch protocol into typed events: `Meta`, `ThinkStart`, `ThinkDelta`, `ContentStart`, `ContentDelta`, `Done`. The session is destroyed when the stream ends via `GuardedStream::drop`, which also calls `stop_stream` on abnormal disconnects. Sessions are tracked in `active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>`.
+Each `v0_chat()` call creates a dedicated session (chunked 路径整请求共享一个 session), then streams the response. The response is a `StreamEvent` stream (not raw SSE bytes) — the **精简响应协议** abstracts away DeepSeek's p/o/v patch protocol into typed events: `Meta`, `ThinkStart`, `ThinkDelta`, `ContentStart`, `ContentDelta`, `Done`. The session is destroyed when the stream ends via `ResponseStream::drop`, which also calls `stop_stream` on abnormal disconnects. Sessions are tracked in `active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>`.
 
-The `Chat` module dispatches across 3 request paths based on prompt size:
-- **Normal path** (`v0_chat_once`): prompt fits within model limit, sent directly
-- **History-split path** (`v0_chat_oversized_file`): oversize default model, splits history into uploaded files
-- **Chunked path** (`v0_chat_oversized_chunk`): oversize expert model, uses chunked completion with file writes
+The `Chat` module dispatches across 3 request paths based on **字符数** (`prompt.chars().count()`)，阈值 = `input_character_limits[model_type] * 75%`（硬编码）：
+- **Normal path** (`v0_chat_once`): prompt 未超阈值，直发
+- **History-split path** (`v0_chat_oversized_file`): 超阈值且非 expert，拆分历史块上传为 `EMPTY.txt`，inline 部分直发
+- **Chunked path** (`v0_chat_oversized_chunk`): 超阈值且 expert，纯字符切分多次 completion，靠 `parent_message_id` 串接（**不写文件**）
 
 ### Single-Struct Pipeline (OpenAI)
 
@@ -278,11 +278,12 @@ Primary tag: per-tool XML `<tool_name>` (tag name = tool name). Configurable ext
 
 ### History Splitting & File Upload
 
-Multi-turn conversations split history at `split_history_prompt()`:
-- The last user+assistant pair + final user message go **inline** in the prompt
-- Earlier turns are wrapped in `[file content begin]`/`[file content end]` markers and uploaded as `EMPTY.txt`
+**仅当 prompt 超过 `input_character_limits[model_type] * 75%` 阈值时触发**（`v0_chat` 中 `prompt.chars().count() > threshold`），由 `v0_chat_oversized_file` 调用 `split_history_prompt()`：
+- 拆分点 = prompt 中最后一个 `<｜Assistant｜>` 块。该块本身走 **inline**，其前的所有块作为 history
+- history 文本外层用 `[file content end]\n\n...\n[file name]: IGNORE\n[file content begin]\n` 标记包裹（顺序刻意反置，让模型把后续 inline 当作真实当前输入），上传为 `EMPTY.txt`
 - External files (data URLs) upload individually with a separate PoW computation targeting `/api/v0/file/upload_file`
-- Upload polling: 3 attempts with 0.5/1/2s backoff, checking file existence via `fetch_files`
+- Upload polling: 2s 间隔 × 30 次（最多 60s），轮询 `fetch_files` 直到 `SUCCESS`/`FAILED` 或超时
+- History 上传失败时退回完整 prompt 内联发送（[file content] markers 容错兜底）
 
 ### Capability Toggles
 
@@ -298,7 +299,23 @@ Request fields mapped in `request/resolver.rs`:
 
 ### Oversized Prompt Fallback
 
-When the prompt (after history splitting) exceeds the completion endpoint's limit, the system falls back to chunked completion (`/api/v0/chat/completion` with file upload) or a dedicated vision model for image-heavy requests. The `oversized_prompt` config section controls threshold and model routing. Implemented in `ds_core/src/chat/request.rs` alongside the normal `v0_chat()` flow.
+`v0_chat()` ([ds_core/src/chat/request.rs](file:///workspace/ds_core/src/chat/request.rs)) 按字符数路由，**不存在 `oversized_prompt` 配置段**：
+
+```rust
+let limit = input_character_limit_for(model_type);
+let threshold = limit * 75 / 100;          // 硬编码 75%
+if prompt.chars().count() > threshold {
+    match model_type {
+        "expert" => v0_chat_oversized_chunk,   // 分块路径
+        _        => v0_chat_oversized_file,    // 历史拆分路径（见上一节）
+    };
+}
+// 否则 v0_chat_once（正常路径）
+```
+
+- **路径选择基于 `prompt.chars().count()`，不是 token 数**。tiktoken 计数仅用于 usage 上报，不参与路由
+- **History-split 路径** (`v0_chat_oversized_file`)：把历史块上传为 `EMPTY.txt`，inline 部分直发（见上一节）
+- **Chunked 路径** (`v0_chat_oversized_chunk`，仅 expert)：**不写文件**，而是按 `chunk_size = limit * 75%` 纯字符切分 prompt（不感知 ChatML 标签边界），多次调用 completion，靠 `parent_message_id` 把多个响应串成 session 内的连续消息。非末 chunk 强制 `thinking=false, search=false`；末 chunk 恢复原始配置并返回流
 
 ### Anthropic Compatibility Layer
 
@@ -428,7 +445,7 @@ Follow `docs/code-style.md`:
 | Tool call parse failure | No `tool_calls` in response, raw XML visible | Model output a tool tag whose name is not in the parse list. Add the tool name to `extra_tool_names` in `config.toml` `[ds_core.tool_call]` |
 | Rate limited | Repeated `CoreError::Overloaded` | Add more accounts or reduce concurrency. 6x exponential backoff handles transient spikes |
 | Session errors mid-stream | `invalid message id`, session not found | Usually handled by `GuardedStream::drop` cleanup. If persistent, check concurrent access to same account |
-| Oversized prompt rejected | `413` or truncation errors | Prompt exceeds DeepSeek limit. The oversized prompt fallback (chunked completion + file upload) handles this automatically; check `oversized_prompt` config section |
+| Oversized prompt rejected | `413` or truncation errors | Prompt exceeds DeepSeek limit. 自动触发 oversized 路径：非 expert 走历史拆分上传 `EMPTY.txt`，expert 走 chunked completion（不写文件）。阈值由 `input_character_limits` × 75% 决定，无 `oversized_prompt` 配置段 |
 | Streaming stalls | No SSE events after initial connection | Check `RUST_LOG=adapter=trace,ds_core::accounts=debug,info` for where the pipeline halts |
 | Working inside `ds_core/` | `cargo` not finding manifests | Run commands from workspace root, not from inside `ds_core/`. Use `cargo build -p ds_core` |
 
@@ -442,10 +459,10 @@ Follow `docs/code-style.md`:
 | Config loading | `src/config.rs` | Single unified entry, `-c` flag support |
 | Config reference | `config.example.toml` | All fields documented with examples (authoritative) |
 | DeepSeek chat flow | `ds_core/src/` | accounts → pow → completions → client |
-| Chat orchestration + file upload | `ds_core/src/chat/request.rs` + `response.rs` | `v0_chat()`, history splitting, upload retry, `GuardedStream` |
+| Chat orchestration + file upload | `ds_core/src/chat/request.rs` + `response.rs` | `v0_chat()`, 3 路径分流（normal/oversized_file/oversized_chunk）, history splitting, upload retry (2s×30), `ResponseStream` |
 | OpenAI request parsing | `src/openai_adapter/request/` | normalize → tools → files → prompt → resolver |
 | File upload extraction | `src/openai_adapter/request/files.rs` | data URL → FilePayload, HTTP URL → search mode |
-| Token counting (tiktoken) | `src/openai_adapter.rs` | `OpenAIAdapter::bpe` field, inlined in `chat_completions()` |
+| Token counting (tiktoken) | `src/openai_adapter.rs` | `OpenAIAdapter::bpe` field, inlined in `chat_completions()`. **仅用于 usage 上报**（DeepSeek 后端返回 0）；路径选择基于字符数，与此无关 |
 | OpenAI response conversion | `src/openai_adapter/response/` | converter → tool_parser → repair → stop_detect |
 | Tool call parser & stop sequences | `src/openai_adapter/response/tool_parser.rs` | `TagConfig` with `tool_names` (per-tool XML tags); stop filtering embedded |
 | Stream pipeline config | `src/openai_adapter/response.rs` | `StreamCfg` struct (consolidates 8 stream params) |
