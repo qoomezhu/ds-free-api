@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.7] - 2026-06-26
+
+### Feat: 反代加固与文档同步
+
+针对 DeepSeek 后端基于固定字符串指纹识别反代的特征，对多处固定字符串做随机化轮换；同步修正 AGENTS.md 中关于 1M 上下文机制的描述偏差。
+
+**反代加固（每次请求随机轮换，避免固定字符串指纹）**：
+
+- **高收益 - 工具调用注入模板随机化**：schema 描述行前缀（`Description:`/`功能描述:`/`说明:` 3 变体）+ 工具调用指令文本（4 等价变体，均要求模型用 per-tool XML 输出）随机轮换。保留 `## Tools`/`### Tool {name}` 等核心关键字不变，测试兼容
+- **高收益 - PoW 计算后延迟**：PoW 求解后按 `[200, 800]ms` 随机延迟发送，模拟浏览器 JS 计算 DeepSeekHashV1 的耗时，避免反代"秒算 PoW"特征
+- **中收益 - 历史文件名随机化**：删除固定常量 `EMPTY.txt`，改为 `notes-{hex}.txt`/`doc-{hex}.txt`/`memo-{hex}.txt` 等 5 前缀 × 16M 后缀随机文件名，消除"文件名 EMPTY 但实际包含完整历史"的语义反差指纹
+- **中收益 - 请求间隔抖动**：请求前随机延迟 `[500, 3000]ms`，模拟人类对话思考+输入停顿，避免固定间隔机械行为
+- **中收益 - 单账号日请求上限**：默认 80/天，达到后该账号当日不再被选中，避免单账号高频调用触发黄色熔断
+- **低收益 - 文件内容 marker 随机化**：`split_history_prompt` 的 `[file content end]`/`[file name]: IGNORE`/`[file content begin]` 三段标记在 3 个语义等价变体（英文/中文/简写）中随机轮换
+
+**配置项**（`[ds_core.behavior]` 段，可热更新）：
+
+```toml
+[ds_core.behavior]
+request_jitter_ms = [500, 3000]     # 请求前随机延迟
+daily_request_limit = 80            # 单账号每日请求上限
+pow_delay_ms = [200, 800]           # PoW 计算后随机延迟
+```
+
+**文档同步**：修正 AGENTS.md 中关于 1M 上下文机制的描述偏差——明确 `oversized_prompt` 配置段已不存在、chunked 路径不写文件靠 `parent_message_id` 串接、upload 轮询实际为 2s×30 次、tiktoken 仅用于 usage 不参与路径选择。
+
+**TLS/HTTP2 指纹**：由 `wreq` Emulation::Chrome136 覆盖（Chrome 136 TLS fingerprint + HTTP/2 帧序 + Header 顺序），无需额外代码改动。
+
+---
+
 ## [0.2.7-pre1] - 2026-05-14
 
 ### Fix: 主要修复因为官方限制expert模型的上传文件导致的问题, 以及其他的一些修改
