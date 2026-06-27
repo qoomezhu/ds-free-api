@@ -46,6 +46,8 @@ fn behavior_cfg_from(s: &crate::config::BehaviorSection) -> BehaviorConfig {
         request_jitter_ms: (jmin, jmax),
         daily_request_limit: s.daily_request_limit,
         pow_delay_ms: (pmin, pmax),
+        persist_sessions: s.persist_sessions,
+        skip_startup_health_check: s.skip_startup_health_check,
     }
 }
 

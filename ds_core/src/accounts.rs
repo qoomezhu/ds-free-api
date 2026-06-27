@@ -51,19 +51,22 @@ impl Accounts {
         let pool = AccountPool::new();
         pool.set_daily_request_limit(config.behavior.daily_request_limit)
             .await;
-        pool.init(account_creds, &client, &solver)
-            .await
-            .map_err(|e| match e {
-                PoolError::AllAccountsFailed => {
-                    CoreError::ProviderError("所有账号初始化失败".to_string())
-                }
-                PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
-                PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
-                PoolError::Validation(msg) => {
-                    CoreError::ProviderError(format!("配置错误: {}", msg))
-                }
-                other => CoreError::ProviderError(other.to_string()),
-            })?;
+        pool.init(
+            account_creds,
+            &client,
+            &solver,
+            config.behavior.skip_startup_health_check,
+        )
+        .await
+        .map_err(|e| match e {
+            PoolError::AllAccountsFailed => {
+                CoreError::ProviderError("所有账号初始化失败".to_string())
+            }
+            PoolError::Client(e) => CoreError::ProviderError(e.to_string()),
+            PoolError::Pow(e) => CoreError::ProofOfWorkFailed(e),
+            PoolError::Validation(msg) => CoreError::ProviderError(format!("配置错误: {}", msg)),
+            other => CoreError::ProviderError(other.to_string()),
+        })?;
 
         let pool = Arc::new(pool);
         pool.set_client_solver(client.clone(), solver.clone()).await;

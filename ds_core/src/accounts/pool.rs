@@ -250,6 +250,7 @@ impl AccountPool {
         creds: Vec<AccountConfig>,
         client: &DsClient,
         solver: &PowSolver,
+        skip_health_check: bool,
     ) -> Result<(), PoolError> {
         if creds.is_empty() {
             return Ok(());
@@ -259,14 +260,15 @@ impl AccountPool {
         use std::sync::Arc;
         use tokio::sync::Semaphore;
 
-        // 限制并发初始化数，避免对 DeepSeek 端和本地连接池造成压力
-        let semaphore = Arc::new(Semaphore::new(13));
+        // 防封号：账号初始化必须串行，避免同 IP 瞬间批量登录
+        let semaphore = Arc::new(Semaphore::new(1));
         let futures: Vec<_> = creds
             .into_iter()
             .map(|creds| {
                 let client = client.clone();
                 let solver = solver.clone();
                 let sem = semaphore.clone();
+                let skip_hc = skip_health_check;
                 async move {
                     let _permit = sem.acquire().await.expect("信号量未关闭");
                     let display_id = if creds.email.is_empty() {
@@ -274,7 +276,11 @@ impl AccountPool {
                     } else {
                         creds.email.clone()
                     };
-                    let account = match init_account(&creds, &client, &solver).await {
+                    let account = match if skip_hc {
+                        init_account_login_only(&creds, &client).await
+                    } else {
+                        init_account(&creds, &client, &solver).await
+                    } {
                         Ok(account) => {
                             info!(target: "ds_core::accounts", "Account {} initialized successfully", display_id);
                             account
@@ -314,7 +320,7 @@ impl AccountPool {
         &self,
         creds: &AccountConfig,
         client: &DsClient,
-        solver: &PowSolver,
+        _solver: &PowSolver,
     ) -> Result<String, PoolError> {
         let display_id = if creds.email.is_empty() {
             creds.mobile.clone()
@@ -327,7 +333,9 @@ impl AccountPool {
             return Err(PoolError::AlreadyExists(display_id));
         }
 
-        let account = init_account(creds, client, solver).await?;
+        // ponytail: 动态加号默认只登录，不做 health_check；
+        // health_check 会创建+删除 test session，是封号高危特征。
+        let account = init_account_login_only(creds, client).await?;
         let _id = account.display_id().to_string();
         self.accounts.insert(display_id.clone(), Arc::new(account));
         info!(target: "ds_core::accounts", "Account {} added dynamically", display_id);
@@ -503,9 +511,11 @@ impl AccountPool {
 
     /// 尝试重新登录 Error 状态的账号
     /// 成功 → Idle，失败 → error_count++，≥3 则 Invalid
-    async fn re_login_account(account: &Account, client: &DsClient, solver: &PowSolver) {
+    async fn re_login_account(account: &Account, client: &DsClient, _solver: &PowSolver) {
         let display_id = account.display_id().to_string();
-        match try_init_account(&account.creds, client, solver).await {
+        // ponytail: 恢复任务只刷新登录 token，不做 health_check。
+        // 账号是否 muted 由真实请求发现；后台 test completion 会额外消耗风控额度。
+        match init_account_login_only(&account.creds, client).await {
             Ok(new_account) => {
                 // 更新 token
                 *account.token.write().unwrap() = new_account.token.read().unwrap().clone();
@@ -559,6 +569,63 @@ async fn init_account(
     solver: &PowSolver,
 ) -> Result<Account, PoolError> {
     try_init_account(creds, client, solver).await
+}
+
+/// 仅登录，不做健康检查（防封号模式）
+///
+/// 健康检查会创建 session → 发 test 消息 → 删除 session，
+/// 这在批量启动时触发 DeepSeek 的批量登录检测，导致全封。
+async fn init_account_login_only(
+    creds: &AccountConfig,
+    client: &DsClient,
+) -> Result<Account, PoolError> {
+    if creds.email.is_empty() && creds.mobile.is_empty() {
+        return Err(PoolError::Validation(
+            "email 和 mobile 不能同时为空".to_string(),
+        ));
+    }
+
+    let login_payload = LoginPayload {
+        email: if creds.email.is_empty() {
+            None
+        } else {
+            Some(creds.email.clone())
+        },
+        mobile: if creds.mobile.is_empty() {
+            None
+        } else {
+            Some(creds.mobile.clone())
+        },
+        password: creds.password.clone(),
+        area_code: if creds.area_code.is_empty() {
+            None
+        } else {
+            Some(creds.area_code.clone())
+        },
+        device_id: String::new(),
+        os: "web".to_string(),
+    };
+
+    let login_data = client.login(&login_payload).await?;
+    let token = login_data.user.token;
+
+    debug!(
+        target: "ds_core::accounts",
+        "login_only: 账号登录成功 (跳过健康检查) email={:?} mobile={:?}",
+        &creds.email, &creds.mobile
+    );
+
+    Ok(Account {
+        token: std::sync::RwLock::new(token.into()),
+        email: creds.email.clone(),
+        mobile: creds.mobile.clone(),
+        state: AtomicU8::new(AccountState::Idle as u8),
+        last_released: AtomicI64::new(0),
+        error_count: AtomicU8::new(0),
+        creds: creds.clone(),
+        daily_count: AtomicU32::new(0),
+        daily_day: AtomicU32::new(utc_day_index()),
+    })
 }
 
 async fn try_init_account(

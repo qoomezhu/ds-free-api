@@ -224,7 +224,7 @@ impl Chat {
                 Ok(h) => h,
                 Err(e) => {
                     self.accounts.mark_error(&account_id);
-                    let _ = self.accounts.delete_session(&token, &session_id).await;
+                    self.maybe_delete_session(&token, &session_id).await;
                     return Err(e);
                 }
             };
@@ -248,7 +248,7 @@ impl Chat {
                 Ok(s) => s,
                 Err(e) => {
                     self.accounts.mark_error(&account_id);
-                    let _ = self.accounts.delete_session(&token, &session_id).await;
+                    self.maybe_delete_session(&token, &session_id).await;
                     return Err(e);
                 }
             };
@@ -292,7 +292,7 @@ impl Chat {
             Ok(h) => h,
             Err(e) => {
                 self.accounts.mark_error(&account_id);
-                let _ = self.accounts.delete_session(&token, &session_id).await;
+                self.maybe_delete_session(&token, &session_id).await;
                 return Err(e);
             }
         };
@@ -316,7 +316,7 @@ impl Chat {
             Ok(s) => s,
             Err(e) => {
                 self.accounts.mark_error(&account_id);
-                let _ = self.accounts.delete_session(&token, &session_id).await;
+                self.maybe_delete_session(&token, &session_id).await;
                 return Err(e);
             }
         };
@@ -403,7 +403,7 @@ impl Chat {
                     "req={} hint 错误: {}", request_id, hint_detail
                 );
             }
-            let _ = self.accounts.delete_session(&token, &session_id).await;
+            self.maybe_delete_session(&token, &session_id).await;
             log::debug!(
                 target: "ds_core::accounts",
                 "req={} hint 后清理 session: id={}", request_id, session_id
@@ -443,6 +443,7 @@ impl Chat {
                     session_id,
                     message_id: stop_id,
                     sessions: self.active_sessions.clone(),
+                    persist: self.persist_sessions(),
                 },
                 account_id.clone(),
             )),
@@ -666,7 +667,7 @@ impl Chat {
                     "req={} hint 错误: {}", request_id, hint_detail
                 );
             }
-            let _ = self.accounts.delete_session(&token, &session_id).await;
+            self.maybe_delete_session(&token, &session_id).await;
             log::debug!(
                 target: "ds_core::accounts",
                 "req={} hint 后清理 session: id={}", request_id, session_id
@@ -706,6 +707,7 @@ impl Chat {
                     session_id,
                     message_id: stop_id,
                     sessions: self.active_sessions.clone(),
+                    persist: self.persist_sessions(),
                 },
                 account_id.clone(),
             )),

@@ -69,13 +69,19 @@ port = 22217
 # 反代行为伪装配置（降低封号风险）
 # [ds_core.behavior]
 # 请求前随机延迟范围（毫秒），模拟真实浏览器的思考/打字停顿。设为 [0, 0] 禁用。
-# request_jitter_ms = [500, 3000]
+# request_jitter_ms = [2000, 8000]
 # 单账号每日请求上限，达到后该账号当日不再被选中。设为 0 表示不限制。
-# 建议值 50-100，真实用户每日对话量有限，高频调用会触发 DeepSeek 黄色熔断。
-# daily_request_limit = 80
-# PoW 计算后随机延迟范围（毫秒），模拟真实浏览器 JS 计算 DeepSeekHashV1 的耗时。
-# 反代用 wasmtime 秒算 PoW，真实浏览器需要 200-800ms。设为 [0, 0] 禁用。
+# daily_request_limit = 20
+# PoW 计算后随机延迟范围（毫秒），模拟真实浏览器 JS 计算耗时。设为 [0, 0] 禁用。
 # pow_delay_ms = [200, 800]
+#
+# ── 防封号核心开关（强烈建议保持默认 true）──
+# 是否持久化 session（不删除对话）。每次请求创建+销毁 session 是最大的封号触发特征。
+# 设为 true 后 session 保留不删除，DeepSeek 无法通过 session 生命周期检测反代行为。
+# persist_sessions = true
+# 是否跳过启动时的批量健康检查。启动时对所有账号执行 test 会触发批量登录检测，导致全封。
+# 设为 true 后延迟到首次请求时才验证账号可用性。
+# skip_startup_health_check = true
 
 # Admin 配置（由管理面板自动管理，部署时无需手动填写）
 # [admin]

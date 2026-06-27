@@ -100,6 +100,8 @@ impl DsCore {
     }
 
     pub async fn reload_config(&self, config: &DsCoreConfig) -> Result<(), CoreError> {
-        self.accounts.reload_config(config).await
+        self.accounts.reload_config(config).await?;
+        self.chat.reload_config(config);
+        Ok(())
     }
 }

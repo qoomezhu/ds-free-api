@@ -75,23 +75,20 @@ pub struct DsCoreSection {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BehaviorSection {
     /// 请求前随机延迟范围（毫秒）：[min, max]
-    ///
-    /// 真实浏览器发消息前有思考、打字停顿，固定间隔会被识别为机械行为。
-    /// 设为 [0, 0] 可禁用抖动。
     #[serde(default = "default_request_jitter_ms")]
     pub request_jitter_ms: [u64; 2],
-    /// 单账号每日请求上限，达到后该账号当日不再被选中
-    ///
-    /// 真实用户每日对话量有限，单账号高频调用会触发 DeepSeek 黄色熔断。
-    /// 设为 0 表示不限制。
+    /// 单账号每日请求上限
     #[serde(default = "default_daily_request_limit")]
     pub daily_request_limit: u32,
     /// PoW 计算后随机延迟范围（毫秒）：[min, max]
-    ///
-    /// 反代用 wasmtime 秒算 PoW，真实浏览器需要 200-800ms。算完后延迟发送
-    /// 可避免被 PoW 时延异常标记。设为 [0, 0] 禁用。
     #[serde(default = "default_pow_delay_ms")]
     pub pow_delay_ms: [u64; 2],
+    /// 是否持久化 session（不删除对话）—— 防封号核心开关
+    #[serde(default = "default_true")]
+    pub persist_sessions: bool,
+    /// 是否跳过启动时的批量健康检查 —— 防封号开关
+    #[serde(default = "default_true")]
+    pub skip_startup_health_check: bool,
 }
 
 impl Default for BehaviorSection {
@@ -100,16 +97,22 @@ impl Default for BehaviorSection {
             request_jitter_ms: default_request_jitter_ms(),
             daily_request_limit: default_daily_request_limit(),
             pow_delay_ms: default_pow_delay_ms(),
+            persist_sessions: true,
+            skip_startup_health_check: true,
         }
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_request_jitter_ms() -> [u64; 2] {
-    [500, 3000]
+    [2000, 8000]
 }
 
 fn default_daily_request_limit() -> u32 {
-    80
+    20
 }
 
 fn default_pow_delay_ms() -> [u64; 2] {

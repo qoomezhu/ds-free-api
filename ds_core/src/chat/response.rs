@@ -51,6 +51,8 @@ pub(crate) struct SessionHandle {
     pub(crate) session_id: String,
     pub(crate) message_id: i64,
     pub(crate) sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
+    /// 是否持久化 session（不删除对话）
+    pub(crate) persist: bool,
 }
 
 impl SessionHandle {
@@ -60,6 +62,7 @@ impl SessionHandle {
         let token = self.token.clone();
         let session_id = self.session_id.clone();
         let message_id = self.message_id;
+        let persist = self.persist;
 
         tokio::spawn(async move {
             if !finished {
@@ -71,6 +74,17 @@ impl SessionHandle {
                     log::warn!(target: "ds_core::accounts", "stop_stream failed: {}", e);
                 }
             }
+
+            // 持久化模式：只保留 session，不删除对话。
+            // ponytail: stop_stream 仍保留；否则客户端断流时上游会继续生成。
+            if persist {
+                log::debug!(
+                    target: "ds_core::accounts",
+                    "session persist mode: 保留 session {} (不删除对话)", session_id
+                );
+                return;
+            }
+
             if let Err(e) = client.delete_session(&token, &session_id).await {
                 log::warn!(target: "ds_core::accounts", "delete_session failed: {}", e);
             }

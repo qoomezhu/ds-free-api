@@ -7,7 +7,7 @@ mod request;
 mod response;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::accounts::Accounts;
 use crate::config::{BehaviorConfig, DsCoreConfig};
@@ -24,7 +24,7 @@ pub struct Chat {
     active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     model_types: Vec<String>,
     input_character_limits: Vec<u32>,
-    behavior: BehaviorConfig,
+    behavior: RwLock<BehaviorConfig>,
 }
 
 impl Chat {
@@ -35,8 +35,35 @@ impl Chat {
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
             model_types: config.model_types.clone(),
             input_character_limits: config.input_character_limits.clone(),
-            behavior: config.behavior.clone(),
+            behavior: RwLock::new(config.behavior.clone()),
         }
+    }
+
+    /// 当前行为配置快照（热更新生效）
+    fn behavior_snapshot(&self) -> BehaviorConfig {
+        self.behavior.read().unwrap().clone()
+    }
+
+    /// 是否保留 DeepSeek session，不删除对话
+    fn persist_sessions(&self) -> bool {
+        self.behavior_snapshot().persist_sessions
+    }
+
+    /// 按配置决定是否删除 session。persist=true 时只记录，不删。
+    async fn maybe_delete_session(&self, token: &str, session_id: &str) {
+        if self.persist_sessions() {
+            log::debug!(
+                target: "ds_core::accounts",
+                "persist_sessions=true: 跳过 delete_session {}", session_id
+            );
+            return;
+        }
+        let _ = self.accounts.delete_session(token, session_id).await;
+    }
+
+    /// 热更新行为配置（避免为了改防封参数重启容器）
+    pub fn reload_config(&self, config: &DsCoreConfig) {
+        *self.behavior.write().unwrap() = config.behavior.clone();
     }
 
     /// 请求前随机延迟，模拟真实浏览器的思考/打字停顿
@@ -44,7 +71,7 @@ impl Chat {
     /// jitter 范围为 (0, 0) 时禁用。使用纳秒时间戳的低 32 位做轻量随机源，
     /// 避免引入 rand 依赖。
     async fn apply_request_jitter(&self) {
-        let (min, max) = self.behavior.request_jitter_ms;
+        let (min, max) = self.behavior_snapshot().request_jitter_ms;
         if max == 0 {
             return;
         }
@@ -90,6 +117,8 @@ impl Chat {
         use crate::accounts::StopStreamPayload;
         use futures::future::join_all;
 
+        let persist = self.persist_sessions();
+
         let futures: Vec<_> = sessions
             .into_values()
             .map(|s| {
@@ -100,16 +129,18 @@ impl Chat {
                         message_id: s.message_id,
                     };
                     let _ = accounts.stop_stream(&s.token, &payload).await;
-                    let _ = accounts
-                        .delete_session(&s.token, &s.session_id)
-                        .await
-                        .inspect_err(|e| {
-                            log::warn!(
-                                target: "ds_core::accounts",
-                                "shutdown 清理 session {} 失败: {}",
-                                s.session_id, e
-                            );
-                        });
+                    if !persist {
+                        let _ = accounts
+                            .delete_session(&s.token, &s.session_id)
+                            .await
+                            .inspect_err(|e| {
+                                log::warn!(
+                                    target: "ds_core::accounts",
+                                    "shutdown 清理 session {} 失败: {}",
+                                    s.session_id, e
+                                );
+                            });
+                    }
                 }
             })
             .collect();
